@@ -78,6 +78,23 @@ docker compose up -d --build
 across image rebuilds and container recreations — see [docker-compose.yml](docker-compose.yml).
 To update after pulling new code: `docker compose up -d --build`.
 
+## Releases
+
+Pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) triggers
+[.github/workflows/release.yml](.github/workflows/release.yml), which:
+
+- builds a Linux x86_64 binary and attaches it to a new GitHub Release (with auto-generated
+  release notes),
+- builds and pushes a multi-purpose Docker image to the GitHub Container Registry as
+  `ghcr.io/linventif/discord-anti-scam-bot:<version>` and `:latest`.
+
+To run the published image directly instead of building locally, point `docker-compose.yml`'s
+`build: .` to `image: ghcr.io/linventif/discord-anti-scam-bot:latest` (or a specific version tag),
+then `docker compose up -d` — no local build step or Rust toolchain needed.
+
+Every push to `main` also runs [.github/workflows/ci.yml](.github/workflows/ci.yml) (build + test)
+so regressions get caught before they reach a release.
+
 ## Moderation commands (in Discord)
 
 Restricted to members with a role listed in `mod_role_ids` (config.toml), or by default to
