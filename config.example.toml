@@ -50,3 +50,19 @@ min_channels = 3
 window_seconds = 60
 # Max Hamming distance to consider two images "the same" in this context.
 same_image_threshold = 6
+
+[links]
+# Also fetch and check images posted as plain links (not just attachments), e.g. an
+# imgur link. Only hosts in `allowed_hosts` are ever fetched — the bot must not
+# become an open URL-fetching proxy for arbitrary links found in messages.
+enabled = true
+allowed_hosts = [
+    "imgur.com",
+    "i.imgur.com",
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+]
+
+[storage]
+# SQLite database used to persist flood-detection state across restarts.
+database_path = "data/bot.sqlite3"

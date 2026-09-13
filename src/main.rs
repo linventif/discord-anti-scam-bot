@@ -3,6 +3,7 @@ mod config;
 mod flood;
 mod handler;
 mod hashstore;
+mod linkimage;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use config::Config;
 use flood::FloodDetector;
 use handler::Handler;
 use hashstore::ReferenceStore;
+use linkimage::LinkImageFetcher;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,11 +34,15 @@ async fn main() -> Result<()> {
         config.detection.reference_dir
     );
 
-    let flood = Arc::new(FloodDetector::new(
-        config.flood.window_seconds,
-        config.flood.same_image_threshold,
-        config.flood.min_channels,
-    ));
+    let flood = Arc::new(
+        FloodDetector::open(
+            &config.storage.database_path,
+            config.flood.window_seconds,
+            config.flood.same_image_threshold,
+            config.flood.min_channels,
+        )
+        .context("opening the flood-detection database")?,
+    );
 
     {
         let flood = flood.clone();
@@ -50,12 +56,14 @@ async fn main() -> Result<()> {
         });
     }
 
+    let links = LinkImageFetcher::new(&config.links.allowed_hosts);
+
     let token = std::env::var("DISCORD_TOKEN")
         .context("missing DISCORD_TOKEN environment variable (see .env.example)")?;
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
-    let handler = Handler { config, store, flood };
+    let handler = Handler { config, store, flood, links };
 
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)

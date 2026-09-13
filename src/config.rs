@@ -9,6 +9,8 @@ pub struct Config {
     pub moderation: ModerationConfig,
     pub detection: DetectionConfig,
     pub flood: FloodConfig,
+    pub links: LinksConfig,
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -51,6 +53,18 @@ pub struct FloodConfig {
     pub min_channels: usize,
     pub window_seconds: u64,
     pub same_image_threshold: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LinksConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StorageConfig {
+    pub database_path: String,
 }
 
 impl Config {

@@ -8,12 +8,14 @@ the offending messages, and sanctions the account according to config.
 
 1. On startup, the bot loads every image in the `reference/` folder (screenshots of already
    identified compromised accounts) and computes their perceptual hash.
-2. Every image sent on the server is downloaded, hashed, and compared against that reference set
-   (Hamming distance). A match below `match_threshold` triggers a detection — even if the image
-   has been recompressed/cropped.
+2. Every image sent on the server — as an attachment, or as a plain link to an allow-listed image
+   host such as imgur — is downloaded, hashed, and compared against that reference set (Hamming
+   distance). A match below `match_threshold` triggers a detection — even if the image has been
+   recompressed/cropped, including a crop down to just the middle of the screenshot.
 3. In addition: if the same account posts the same image across several different channels in a
    short time (typical of a compromised account spamming everywhere it has access to), it's
-   flagged even if the image isn't in the reference set yet.
+   flagged even if the image isn't in the reference set yet. This activity is persisted to
+   SQLite, so it survives a bot restart.
 4. Based on `config.toml`, the bot deletes the message and applies (or not) a sanction: timeout,
    kick, or ban. Every detection is logged to a dedicated channel with evidence (image, matched
    reference, score, action taken).
@@ -49,12 +51,30 @@ cargo build --release
 
 The binary reads `config.toml` at the project root (every option is commented there) and the
 `reference/` folder (pre-filled with the initial screenshots gathered when setting up the bot).
+Flood-detection state is kept in a SQLite database at `storage.database_path` (default
+`data/bot.sqlite3`), created automatically on first run.
 
 ## Run
 
 ```bash
 cargo run --release
 ```
+
+## Run with Docker
+
+```bash
+cp .env.example .env        # set your DISCORD_TOKEN
+cp config.example.toml config.toml   # edit as needed
+
+mkdir -p reference data     # persisted outside the container
+# put your reference screenshots in ./reference/
+
+docker compose up -d --build
+```
+
+`config.toml`, `reference/`, and `data/` (the SQLite database) are bind-mounted so they persist
+across image rebuilds and container recreations — see [docker-compose.yml](docker-compose.yml).
+To update after pulling new code: `docker compose up -d --build`.
 
 ## Moderation commands (in Discord)
 
@@ -75,9 +95,12 @@ anyone with the `Manage Messages` permission.
 - `flood.*`: cross-channel flood detection settings.
 - `bot.log_channel_id`: channel where detection evidence gets posted (0 = disabled).
 - `bot.exempt_role_ids` / `moderation.exempt_channel_ids`: roles/channels to ignore.
+- `links.enabled` / `links.allowed_hosts`: fetch and check images posted as plain links (not
+  just attachments) from these hosts only. The bot never fetches an arbitrary URL found in a
+  message — only hosts on this list — to avoid becoming an open URL-fetching proxy.
+- `storage.database_path`: where the SQLite flood-detection database lives.
 
 ## Known limitations (v1)
 
-- Only images sent as **attachments** are analyzed, not images embedded via an external link
-  (imgur, etc.).
-- Flood detection is in-memory: it resets every time the bot restarts.
+- Link-based detection only follows one hop past an allow-listed host's own HTML page (e.g. an
+  imgur gallery page's `og:image`) — it won't chase further redirects to a different host.

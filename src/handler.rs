@@ -12,11 +12,13 @@ use serenity::prelude::*;
 use crate::config::{Action, Config};
 use crate::flood::FloodDetector;
 use crate::hashstore::ReferenceStore;
+use crate::linkimage::LinkImageFetcher;
 
 pub struct Handler {
     pub config: Config,
     pub store: Arc<ReferenceStore>,
     pub flood: Arc<FloodDetector>,
+    pub links: LinkImageFetcher,
 }
 
 enum DetectionReason {
@@ -64,7 +66,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        if msg.attachments.is_empty() {
+        if msg.attachments.is_empty() && !self.config.links.enabled {
             return;
         }
 
@@ -113,45 +115,23 @@ impl EventHandler for Handler {
                 }
             };
 
-            let hash = match self.store.hash_bytes(&bytes) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::debug!("could not hash {}: {e}", attachment.filename);
-                    continue;
-                }
-            };
-
-            if let Some(m) = self.store.best_match(&hash).await {
-                if m.distance <= self.config.detection.match_threshold {
-                    self.on_detection(
-                        &ctx,
-                        &msg,
-                        &bytes,
-                        &attachment.filename,
-                        DetectionReason::KnownReference {
-                            reference: m.filename.clone(),
-                            distance: m.distance,
-                        },
-                    )
-                    .await;
-                    return;
-                }
+            if self.evaluate_image(&ctx, &msg, &bytes, &attachment.filename).await {
+                return;
             }
+        }
 
-            if self.config.flood.enabled {
-                if let Some(channels) = self
-                    .flood
-                    .record_and_check(msg.author.id, msg.channel_id, hash.primary)
-                    .await
-                {
-                    self.on_detection(
-                        &ctx,
-                        &msg,
-                        &bytes,
-                        &attachment.filename,
-                        DetectionReason::CrossChannelFlood { channels },
-                    )
-                    .await;
+        if self.config.links.enabled {
+            for url in self.links.extract_urls(&msg.content) {
+                let bytes = match self.links.fetch_image_bytes(&url).await {
+                    Ok(Some(b)) => b,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::debug!("could not fetch linked image {url}: {e:#}");
+                        continue;
+                    }
+                };
+
+                if self.evaluate_image(&ctx, &msg, &bytes, &url).await {
                     return;
                 }
             }
@@ -160,6 +140,57 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    /// Hashes and checks one image (from an attachment or a fetched link) against
+    /// known references and flood activity. Returns `true` if a detection fired
+    /// (and was handled), so the caller can stop looking at further images in the
+    /// same message.
+    async fn evaluate_image(&self, ctx: &Context, msg: &Message, bytes: &[u8], label: &str) -> bool {
+        let hash = match self.store.hash_bytes(bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!("could not hash {label}: {e}");
+                return false;
+            }
+        };
+
+        if let Some(m) = self.store.best_match(&hash).await {
+            if m.distance <= self.config.detection.match_threshold {
+                self.on_detection(
+                    ctx,
+                    msg,
+                    bytes,
+                    label,
+                    DetectionReason::KnownReference {
+                        reference: m.filename.clone(),
+                        distance: m.distance,
+                    },
+                )
+                .await;
+                return true;
+            }
+        }
+
+        if self.config.flood.enabled {
+            if let Some(channels) = self
+                .flood
+                .record_and_check(msg.author.id, msg.channel_id, hash.primary)
+                .await
+            {
+                self.on_detection(
+                    ctx,
+                    msg,
+                    bytes,
+                    label,
+                    DetectionReason::CrossChannelFlood { channels },
+                )
+                .await;
+                return true;
+            }
+        }
+
+        false
+    }
+
     async fn on_detection(
         &self,
         ctx: &Context,

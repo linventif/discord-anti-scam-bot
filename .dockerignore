@@ -1,0 +1,8 @@
+/target
+.git
+.env
+bot.log
+*.log
+config.toml
+data/
+reference/
