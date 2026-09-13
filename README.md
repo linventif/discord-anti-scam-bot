@@ -153,3 +153,14 @@ away without one.
 
 - Link-based detection only follows one hop past an allow-listed host's own HTML page (e.g. an
   imgur gallery page's `og:image`) — it won't chase further redirects to a different host.
+
+## Contributing
+
+Bug reports, false positive/negative reports, and PRs are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and workflow, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) / [docs/DETECTION.md](docs/DETECTION.md) for how the
+codebase and the detection pipeline are put together.
+
+## License
+
+[MIT](LICENSE)
