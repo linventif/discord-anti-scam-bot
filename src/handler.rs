@@ -5,17 +5,19 @@ use serenity::async_trait;
 use serenity::builder::{CreateAttachment, CreateEmbed, CreateMessage};
 use serenity::model::channel::Message;
 use serenity::model::colour::Colour;
+use serenity::model::application::Interaction;
 use serenity::model::gateway::Ready;
 use serenity::model::timestamp::Timestamp;
 use serenity::prelude::*;
 
 use crate::config::{Action, Config};
+use crate::configstore::ConfigStore;
 use crate::flood::FloodDetector;
 use crate::hashstore::ReferenceStore;
 use crate::linkimage::LinkImageFetcher;
 
 pub struct Handler {
-    pub config: Config,
+    pub config: Arc<ConfigStore>,
     pub store: Arc<ReferenceStore>,
     pub flood: Arc<FloodDetector>,
     pub links: LinkImageFetcher,
@@ -49,9 +51,28 @@ impl DetectionReason {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!("Logged in as {}", ready.user.name);
         tracing::info!("{} reference image(s) in memory", self.store.len().await);
+
+        tracing::info!("in {} guild(s)", ready.guilds.len());
+        let command = crate::slashconfig::build_config_command();
+        for guild in &ready.guilds {
+            match guild.id.set_commands(&ctx.http, vec![command.clone()]).await {
+                Ok(_) => tracing::info!("/config command registered in guild {}", guild.id),
+                Err(e) => tracing::warn!("could not register /config command in guild {}: {e}", guild.id),
+            }
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::Command(command) = interaction {
+            if command.data.name == "config" {
+                if let Err(e) = crate::slashconfig::handle_config_command(self, &ctx, &command).await {
+                    tracing::warn!("error responding to /config: {e:#}");
+                }
+            }
+        }
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -59,23 +80,20 @@ impl EventHandler for Handler {
             return;
         }
 
-        if let Some(rest) = msg.content.strip_prefix(&self.config.bot.prefix) {
-            if let Err(e) = crate::commands::handle_command(self, &ctx, &msg, rest.trim()).await {
+        let cfg = self.config.snapshot().await;
+
+        if let Some(rest) = msg.content.strip_prefix(&cfg.bot.prefix) {
+            if let Err(e) = crate::commands::handle_command(self, &cfg, &ctx, &msg, rest.trim()).await {
                 tracing::warn!("error while handling command: {e:#}");
             }
             return;
         }
 
-        if msg.attachments.is_empty() && !self.config.links.enabled {
+        if msg.attachments.is_empty() && !cfg.links.enabled {
             return;
         }
 
-        if self
-            .config
-            .moderation
-            .exempt_channel_ids
-            .contains(&msg.channel_id.get())
-        {
+        if cfg.moderation.exempt_channel_ids.contains(&msg.channel_id.get()) {
             return;
         }
 
@@ -83,7 +101,7 @@ impl EventHandler for Handler {
             let exempt = member
                 .roles
                 .iter()
-                .any(|r| self.config.moderation.exempt_role_ids.contains(&r.get()));
+                .any(|r| cfg.moderation.exempt_role_ids.contains(&r.get()));
             if exempt {
                 return;
             }
@@ -115,12 +133,12 @@ impl EventHandler for Handler {
                 }
             };
 
-            if self.evaluate_image(&ctx, &msg, &bytes, &attachment.filename).await {
+            if self.evaluate_image(&cfg, &ctx, &msg, &bytes, &attachment.filename).await {
                 return;
             }
         }
 
-        if self.config.links.enabled {
+        if cfg.links.enabled {
             for url in self.links.extract_urls(&msg.content) {
                 let bytes = match self.links.fetch_image_bytes(&url).await {
                     Ok(Some(b)) => b,
@@ -131,7 +149,7 @@ impl EventHandler for Handler {
                     }
                 };
 
-                if self.evaluate_image(&ctx, &msg, &bytes, &url).await {
+                if self.evaluate_image(&cfg, &ctx, &msg, &bytes, &url).await {
                     return;
                 }
             }
@@ -144,7 +162,14 @@ impl Handler {
     /// known references and flood activity. Returns `true` if a detection fired
     /// (and was handled), so the caller can stop looking at further images in the
     /// same message.
-    async fn evaluate_image(&self, ctx: &Context, msg: &Message, bytes: &[u8], label: &str) -> bool {
+    async fn evaluate_image(
+        &self,
+        cfg: &Config,
+        ctx: &Context,
+        msg: &Message,
+        bytes: &[u8],
+        label: &str,
+    ) -> bool {
         let hash = match self.store.hash_bytes(bytes) {
             Ok(h) => h,
             Err(e) => {
@@ -154,8 +179,9 @@ impl Handler {
         };
 
         if let Some(m) = self.store.best_match(&hash).await {
-            if m.distance <= self.config.detection.match_threshold {
+            if m.distance <= cfg.detection.match_threshold {
                 self.on_detection(
+                    cfg,
                     ctx,
                     msg,
                     bytes,
@@ -170,13 +196,14 @@ impl Handler {
             }
         }
 
-        if self.config.flood.enabled {
+        if cfg.flood.enabled {
             if let Some(channels) = self
                 .flood
                 .record_and_check(msg.author.id, msg.channel_id, hash.primary)
                 .await
             {
                 self.on_detection(
+                    cfg,
                     ctx,
                     msg,
                     bytes,
@@ -193,6 +220,7 @@ impl Handler {
 
     async fn on_detection(
         &self,
+        cfg: &Config,
         ctx: &Context,
         msg: &Message,
         bytes: &[u8],
@@ -206,7 +234,7 @@ impl Handler {
             reason.description()
         );
 
-        let action = self.config.moderation.action;
+        let action = cfg.moderation.action;
         let mut action_taken = "No action (log-only mode)".to_string();
 
         if action != Action::LogOnly {
@@ -226,7 +254,7 @@ impl Handler {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs() as i64;
-                            let until = now + (self.config.moderation.timeout_minutes as i64) * 60;
+                            let until = now + (cfg.moderation.timeout_minutes as i64) * 60;
                             match Timestamp::from_unix_timestamp(until) {
                                 Ok(ts) => member
                                     .disable_communication_until_datetime(ctx, ts)
@@ -234,7 +262,7 @@ impl Handler {
                                     .map(|()| {
                                         format!(
                                             "Message deleted + timeout {} min",
-                                            self.config.moderation.timeout_minutes
+                                            cfg.moderation.timeout_minutes
                                         )
                                     })
                                     .map_err(|e| e.to_string()),
@@ -262,12 +290,13 @@ impl Handler {
             }
         }
 
-        self.send_log(ctx, msg, bytes, filename, &reason, &action_taken)
+        self.send_log(cfg, ctx, msg, bytes, filename, &reason, &action_taken)
             .await;
     }
 
     async fn send_log(
         &self,
+        cfg: &Config,
         ctx: &Context,
         msg: &Message,
         bytes: &[u8],
@@ -275,7 +304,7 @@ impl Handler {
         reason: &DetectionReason,
         action_taken: &str,
     ) {
-        let log_channel_id = self.config.bot.log_channel_id;
+        let log_channel_id = cfg.bot.log_channel_id;
         if log_channel_id == 0 {
             return;
         }

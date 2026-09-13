@@ -17,6 +17,7 @@ image = "0.25"
 image_hasher = "3"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+toml_edit = "0.25"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

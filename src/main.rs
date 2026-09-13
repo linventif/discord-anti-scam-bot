@@ -1,9 +1,11 @@
 mod commands;
 mod config;
+mod configstore;
 mod flood;
 mod handler;
 mod hashstore;
 mod linkimage;
+mod slashconfig;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +14,7 @@ use anyhow::{Context as _, Result};
 use serenity::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use config::Config;
+use configstore::ConfigStore;
 use flood::FloodDetector;
 use handler::Handler;
 use hashstore::ReferenceStore;
@@ -25,7 +27,8 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    let config = Config::load("config.toml").context("loading config.toml")?;
+    let config_store = Arc::new(ConfigStore::load("config.toml").context("loading config.toml")?);
+    let config = config_store.snapshot().await;
 
     let store = Arc::new(ReferenceStore::new(&config.detection.reference_dir));
     let loaded = store.load_dir().await.context("loading the reference folder")?;
@@ -63,7 +66,12 @@ async fn main() -> Result<()> {
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
-    let handler = Handler { config, store, flood, links };
+    let handler = Handler {
+        config: config_store,
+        store,
+        flood,
+        links,
+    };
 
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)

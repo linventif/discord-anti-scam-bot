@@ -31,6 +31,31 @@ pub enum Action {
     DeleteBan,
 }
 
+impl Action {
+    /// The exact string this variant is written as in config.toml (matches the
+    /// serde `rename_all = "snake_case"` above).
+    pub fn as_toml_str(self) -> &'static str {
+        match self {
+            Action::LogOnly => "log_only",
+            Action::DeleteOnly => "delete_only",
+            Action::DeleteTimeout => "delete_timeout",
+            Action::DeleteKick => "delete_kick",
+            Action::DeleteBan => "delete_ban",
+        }
+    }
+
+    pub fn from_toml_str(s: &str) -> Option<Self> {
+        match s {
+            "log_only" => Some(Action::LogOnly),
+            "delete_only" => Some(Action::DeleteOnly),
+            "delete_timeout" => Some(Action::DeleteTimeout),
+            "delete_kick" => Some(Action::DeleteKick),
+            "delete_ban" => Some(Action::DeleteBan),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModerationConfig {
     pub action: Action,

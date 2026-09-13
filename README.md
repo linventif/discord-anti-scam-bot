@@ -86,6 +86,25 @@ anyone with the `Manage Messages` permission.
 - `!scam list` — lists the reference files currently in memory.
 - `!scam remove <file>` — removes a reference (filename as shown by `list`).
 
+## `/config` slash command
+
+Change settings live from Discord — no editing `config.toml` or restarting by hand. Requires the
+**Manage Messages** permission (or a role listed in `mod_role_ids`); Discord's UI also hides the
+command entirely from members without that permission. Channel and role options use Discord's
+native picker, and `action` uses a fixed choice list, so there's nothing to type or get wrong.
+
+- `/config log-channel #channel`
+- `/config action <value>`
+- `/config timeout-minutes <minutes>`
+- `/config mod-role add|remove @role`
+- `/config exempt-role add|remove @role`
+- `/config exempt-channel add|remove #channel`
+- `/config show` — prints the current settings
+
+Every change is written to `config.toml` immediately (only the touched key — comments and the
+rest of the file are left alone), so it survives a restart or redeploy, and takes effect right
+away without one.
+
 ## Key settings (`config.toml`)
 
 - `moderation.action`: `log_only` / `delete_only` / `delete_timeout` (default) /
