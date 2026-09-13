@@ -105,7 +105,13 @@ impl EventHandler for Handler {
             return;
         }
 
-        if msg.attachments.is_empty() && !cfg.links.enabled {
+        // A forwarded message carries its own content as a "snapshot" instead of
+        // real attachments on this message — a multi-image scam forwarded from
+        // another channel/server would otherwise be invisible to us.
+        let has_attachments =
+            !msg.attachments.is_empty() || msg.message_snapshots.iter().any(|s| !s.attachments.is_empty());
+
+        if !has_attachments && !cfg.links.enabled {
             return;
         }
 
@@ -123,7 +129,43 @@ impl EventHandler for Handler {
             }
         }
 
-        for attachment in &msg.attachments {
+        if self.scan_attachments(&cfg, &ctx, &msg, &msg.attachments).await {
+            return;
+        }
+        for snapshot in &msg.message_snapshots {
+            if self.scan_attachments(&cfg, &ctx, &msg, &snapshot.attachments).await {
+                return;
+            }
+        }
+
+        if cfg.links.enabled {
+            let texts = std::iter::once(msg.content.as_str())
+                .chain(msg.message_snapshots.iter().map(|s| s.content.as_str()));
+            for text in texts {
+                if self.scan_links(&cfg, &ctx, &msg, text).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Handler {
+    /// Hashes and checks one image (from an attachment or a fetched link) against
+    /// known references and flood activity. Returns `true` if a detection fired
+    /// (and was handled), so the caller can stop looking at further images in the
+    /// same message.
+    /// Downloads and checks every image attachment in a slice (either the
+    /// message's own attachments, or one of its forwarded snapshots'). Returns
+    /// `true` if a detection fired.
+    async fn scan_attachments(
+        &self,
+        cfg: &Config,
+        ctx: &Context,
+        msg: &Message,
+        attachments: &[serenity::model::channel::Attachment],
+    ) -> bool {
+        for attachment in attachments {
             let is_image = attachment
                 .content_type
                 .as_deref()
@@ -149,35 +191,34 @@ impl EventHandler for Handler {
                 }
             };
 
-            if self.evaluate_image(&cfg, &ctx, &msg, &bytes, &attachment.filename).await {
-                return;
+            if self.evaluate_image(cfg, ctx, msg, &bytes, &attachment.filename).await {
+                return true;
             }
         }
-
-        if cfg.links.enabled {
-            for url in self.links.extract_urls(&msg.content) {
-                let bytes = match self.links.fetch_image_bytes(&url).await {
-                    Ok(Some(b)) => b,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::debug!("could not fetch linked image {url}: {e:#}");
-                        continue;
-                    }
-                };
-
-                if self.evaluate_image(&cfg, &ctx, &msg, &bytes, &url).await {
-                    return;
-                }
-            }
-        }
+        false
     }
-}
 
-impl Handler {
-    /// Hashes and checks one image (from an attachment or a fetched link) against
-    /// known references and flood activity. Returns `true` if a detection fired
-    /// (and was handled), so the caller can stop looking at further images in the
-    /// same message.
+    /// Extracts and checks every allow-listed image link in a piece of text
+    /// (the message's own content, or a forwarded snapshot's). Returns `true` if
+    /// a detection fired.
+    async fn scan_links(&self, cfg: &Config, ctx: &Context, msg: &Message, text: &str) -> bool {
+        for url in self.links.extract_urls(text) {
+            let bytes = match self.links.fetch_image_bytes(&url).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!("could not fetch linked image {url}: {e:#}");
+                    continue;
+                }
+            };
+
+            if self.evaluate_image(cfg, ctx, msg, &bytes, &url).await {
+                return true;
+            }
+        }
+        false
+    }
+
     async fn evaluate_image(
         &self,
         cfg: &Config,
