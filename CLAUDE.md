@@ -16,7 +16,7 @@ non-trivial changes instead of re-deriving the design from the source.
 ```bash
 cargo build              # dev build
 cargo build --release    # what actually gets deployed
-cargo test                # 10 tests as of writing; keep them passing
+cargo test                # 14 tests as of writing; keep them passing
 cargo check               # fast type-check while iterating
 ```
 
@@ -26,17 +26,32 @@ Building needs a C compiler (`cc`/`gcc`) on PATH — `rusqlite`'s `bundled` feat
 from source. If a fresh environment fails with `linker 'cc' not found`, that's the fix (e.g.
 `apt install build-essential`), not a code problem.
 
-## Config: two files, not one
+## Config: bot-wide (TOML) vs. per-guild (SQLite) — don't mix these up
 
-- `config.example.toml` — committed, generic template.
-- `config.toml` — gitignored, the actual live config for whatever instance is running. Tests that
-  need a config file copy `config.example.toml` to a throwaway temp path rather than touching
-  this one (see `configstore.rs::tests`).
+This bot runs in multiple Discord servers at once. **Never add a per-server-meaningful setting
+(a channel ID, a role ID, anything an individual server's admin should control) to `Config` /
+`config.toml`.** That file is bot-wide — the same value applies to every guild simultaneously.
+This was a real bug once (see `docs/ARCHITECTURE.md#multi-guild-bot-wide-vs-per-guild-settings`):
+`log_channel_id` and the moderation settings used to live in `config.toml`, so `/config` in one
+server silently overwrote another server's settings.
 
-If you add a new config field, add it to **both** `config.example.toml` (with an explanatory
-comment — this is the only place most users will ever see the option) and, if it's meant to be
-changeable at runtime, wire it into `ConfigStore` (`src/configstore.rs`) and the `/config` slash
-command (`src/slashconfig.rs`), not just `config.rs`'s struct.
+- Bot-wide, deployment-level settings → `Config` (`config.rs`) / `config.toml` /
+  `config.example.toml` / `ConfigStore` (`configstore.rs`). Currently nothing here is
+  runtime-editable.
+- Per-guild settings → `GuildConfig` (`config.rs`) / SQLite `guild_settings` table /
+  `GuildSettingsStore` (`guildstore.rs`), keyed by `guild_id`. This is what `/config`
+  (`slashconfig.rs`) reads and writes.
+
+`config.toml` itself is still split in two: `config.example.toml` (committed, generic template)
+vs. `config.toml` (gitignored, the actual live config for whatever instance is running). Tests
+that need a config file copy `config.example.toml` to a throwaway temp path rather than touching
+this one.
+
+If you add a new bot-wide field, add it to `config.example.toml` too (with an explanatory comment
+— this is the only place most users will ever see the option). If you add a new per-guild field,
+add a column to `guild_settings` (`guildstore.rs`'s `CREATE TABLE`/`read_row`/`write_row`), a
+default in `GuildConfig::default()`, and wire it into `/config` (`slashconfig.rs`) — not into
+`config.toml` at all.
 
 ## Testing gotchas (already hit once, worth not re-discovering)
 
@@ -46,8 +61,17 @@ command (`src/slashconfig.rs`), not just `config.rs`'s struct.
 - **`reference/image.jpg` and `reference/image8.jpg` are near-duplicates** of each other (same
   underlying screenshot). Don't use `image.jpg` as a "this should uniquely match X" test target —
   use `image3.jpg` or `image4.jpg` instead, which don't have a duplicate in the set.
-- Async tests that touch SQLite can use `":memory:"` as the path (`FloodDetector::open`) — no
-  temp-file cleanup needed for those.
+- Async tests that touch SQLite can use `":memory:"` as the path (`FloodDetector::open`,
+  `GuildSettingsStore::open`) — no temp-file cleanup needed for those.
+- **Any SQLite schema change needs a migration, not just an updated `CREATE TABLE IF NOT
+  EXISTS`.** That statement is a no-op against a table that already exists with an older schema —
+  it will NOT add a missing column, and a later `CREATE INDEX` on that column then fails on any
+  pre-existing database file. This broke a real deployment once when `guild_id` was added to
+  `flood_posts`. The fix (see `FloodDetector::open`) is `ALTER TABLE ... ADD COLUMN ...` guarded
+  with `let _ =` (it errors harmlessly with "duplicate column" on a table that already has the
+  column, including one just freshly created) run *before* creating any index that references the
+  new column. `flood.rs::tests::opens_a_pre_multi_guild_database` is the regression test — write
+  an equivalent one for any future schema change.
 
 ## Operational notes
 

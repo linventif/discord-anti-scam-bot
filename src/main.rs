@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod configstore;
 mod flood;
+mod guildstore;
 mod handler;
 mod hashstore;
 mod linkimage;
@@ -16,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use configstore::ConfigStore;
 use flood::FloodDetector;
+use guildstore::GuildSettingsStore;
 use handler::Handler;
 use hashstore::ReferenceStore;
 use linkimage::LinkImageFetcher;
@@ -35,6 +37,11 @@ async fn main() -> Result<()> {
     tracing::info!(
         "{loaded} reference image(s) loaded from '{}'",
         config.detection.reference_dir
+    );
+
+    let guild_settings = Arc::new(
+        GuildSettingsStore::open(&config.storage.database_path)
+            .context("opening the guild-settings database")?,
     );
 
     let flood = Arc::new(
@@ -68,6 +75,7 @@ async fn main() -> Result<()> {
 
     let handler = Handler {
         config: config_store,
+        guild_settings,
         store,
         flood,
         links,

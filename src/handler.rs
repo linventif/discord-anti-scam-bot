@@ -3,21 +3,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serenity::async_trait;
 use serenity::builder::{CreateAttachment, CreateEmbed, CreateMessage};
+use serenity::model::application::Interaction;
 use serenity::model::channel::Message;
 use serenity::model::colour::Colour;
-use serenity::model::application::Interaction;
 use serenity::model::gateway::Ready;
 use serenity::model::timestamp::Timestamp;
 use serenity::prelude::*;
 
-use crate::config::{Action, Config};
+use crate::config::{Action, Config, GuildConfig};
 use crate::configstore::ConfigStore;
 use crate::flood::FloodDetector;
+use crate::guildstore::GuildSettingsStore;
 use crate::hashstore::ReferenceStore;
 use crate::linkimage::LinkImageFetcher;
 
 pub struct Handler {
     pub config: Arc<ConfigStore>,
+    pub guild_settings: Arc<GuildSettingsStore>,
     pub store: Arc<ReferenceStore>,
     pub flood: Arc<FloodDetector>,
     pub links: LinkImageFetcher,
@@ -92,14 +94,18 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot || msg.guild_id.is_none() {
+        let Some(guild_id) = msg.guild_id else {
+            return;
+        };
+        if msg.author.bot {
             return;
         }
 
         let cfg = self.config.snapshot().await;
+        let guild = self.guild_settings.get(guild_id.get()).await;
 
         if let Some(rest) = msg.content.strip_prefix(&cfg.bot.prefix) {
-            if let Err(e) = crate::commands::handle_command(self, &cfg, &ctx, &msg, rest.trim()).await {
+            if let Err(e) = crate::commands::handle_command(self, &guild, &ctx, &msg, rest.trim()).await {
                 tracing::warn!("error while handling command: {e:#}");
             }
             return;
@@ -115,25 +121,28 @@ impl EventHandler for Handler {
             return;
         }
 
-        if cfg.moderation.exempt_channel_ids.contains(&msg.channel_id.get()) {
+        if guild.exempt_channel_ids.contains(&msg.channel_id.get()) {
             return;
         }
 
         if let Ok(member) = msg.member(&ctx).await {
-            let exempt = member
-                .roles
-                .iter()
-                .any(|r| cfg.moderation.exempt_role_ids.contains(&r.get()));
+            let exempt = member.roles.iter().any(|r| guild.exempt_role_ids.contains(&r.get()));
             if exempt {
                 return;
             }
         }
 
-        if self.scan_attachments(&cfg, &ctx, &msg, &msg.attachments).await {
+        if self
+            .scan_attachments(&cfg, &guild, guild_id, &ctx, &msg, &msg.attachments)
+            .await
+        {
             return;
         }
         for snapshot in &msg.message_snapshots {
-            if self.scan_attachments(&cfg, &ctx, &msg, &snapshot.attachments).await {
+            if self
+                .scan_attachments(&cfg, &guild, guild_id, &ctx, &msg, &snapshot.attachments)
+                .await
+            {
                 return;
             }
         }
@@ -142,7 +151,7 @@ impl EventHandler for Handler {
             let texts = std::iter::once(msg.content.as_str())
                 .chain(msg.message_snapshots.iter().map(|s| s.content.as_str()));
             for text in texts {
-                if self.scan_links(&cfg, &ctx, &msg, text).await {
+                if self.scan_links(&cfg, &guild, guild_id, &ctx, &msg, text).await {
                     return;
                 }
             }
@@ -151,16 +160,14 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
-    /// Hashes and checks one image (from an attachment or a fetched link) against
-    /// known references and flood activity. Returns `true` if a detection fired
-    /// (and was handled), so the caller can stop looking at further images in the
-    /// same message.
     /// Downloads and checks every image attachment in a slice (either the
     /// message's own attachments, or one of its forwarded snapshots'). Returns
     /// `true` if a detection fired.
     async fn scan_attachments(
         &self,
         cfg: &Config,
+        guild: &GuildConfig,
+        guild_id: serenity::model::id::GuildId,
         ctx: &Context,
         msg: &Message,
         attachments: &[serenity::model::channel::Attachment],
@@ -191,7 +198,10 @@ impl Handler {
                 }
             };
 
-            if self.evaluate_image(cfg, ctx, msg, &bytes, &attachment.filename).await {
+            if self
+                .evaluate_image(cfg, guild, guild_id, ctx, msg, &bytes, &attachment.filename)
+                .await
+            {
                 return true;
             }
         }
@@ -201,7 +211,15 @@ impl Handler {
     /// Extracts and checks every allow-listed image link in a piece of text
     /// (the message's own content, or a forwarded snapshot's). Returns `true` if
     /// a detection fired.
-    async fn scan_links(&self, cfg: &Config, ctx: &Context, msg: &Message, text: &str) -> bool {
+    async fn scan_links(
+        &self,
+        cfg: &Config,
+        guild: &GuildConfig,
+        guild_id: serenity::model::id::GuildId,
+        ctx: &Context,
+        msg: &Message,
+        text: &str,
+    ) -> bool {
         for url in self.links.extract_urls(text) {
             let bytes = match self.links.fetch_image_bytes(&url).await {
                 Ok(Some(b)) => b,
@@ -212,7 +230,7 @@ impl Handler {
                 }
             };
 
-            if self.evaluate_image(cfg, ctx, msg, &bytes, &url).await {
+            if self.evaluate_image(cfg, guild, guild_id, ctx, msg, &bytes, &url).await {
                 return true;
             }
         }
@@ -222,6 +240,8 @@ impl Handler {
     async fn evaluate_image(
         &self,
         cfg: &Config,
+        guild: &GuildConfig,
+        guild_id: serenity::model::id::GuildId,
         ctx: &Context,
         msg: &Message,
         bytes: &[u8],
@@ -238,7 +258,7 @@ impl Handler {
         if let Some(m) = self.store.best_match(&hash).await {
             if m.distance <= cfg.detection.match_threshold {
                 self.on_detection(
-                    cfg,
+                    guild,
                     ctx,
                     msg,
                     bytes,
@@ -256,11 +276,11 @@ impl Handler {
         if cfg.flood.enabled {
             if let Some(channels) = self
                 .flood
-                .record_and_check(msg.author.id, msg.channel_id, hash.primary)
+                .record_and_check(guild_id, msg.author.id, msg.channel_id, hash.primary)
                 .await
             {
                 self.on_detection(
-                    cfg,
+                    guild,
                     ctx,
                     msg,
                     bytes,
@@ -277,7 +297,7 @@ impl Handler {
 
     async fn on_detection(
         &self,
-        cfg: &Config,
+        guild: &GuildConfig,
         ctx: &Context,
         msg: &Message,
         bytes: &[u8],
@@ -291,7 +311,7 @@ impl Handler {
             reason.description()
         );
 
-        let action = cfg.moderation.action;
+        let action = guild.action;
         let mut action_taken = "No action (log-only mode)".to_string();
 
         if action != Action::LogOnly {
@@ -311,7 +331,7 @@ impl Handler {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs() as i64;
-                            let until = now + (cfg.moderation.timeout_minutes as i64) * 60;
+                            let until = now + (guild.timeout_minutes as i64) * 60;
                             match Timestamp::from_unix_timestamp(until) {
                                 Ok(ts) => member
                                     .disable_communication_until_datetime(ctx, ts)
@@ -319,7 +339,7 @@ impl Handler {
                                     .map(|()| {
                                         format!(
                                             "Message deleted + timeout {} min",
-                                            cfg.moderation.timeout_minutes
+                                            guild.timeout_minutes
                                         )
                                     })
                                     .map_err(|e| e.to_string()),
@@ -347,13 +367,13 @@ impl Handler {
             }
         }
 
-        self.send_log(cfg, ctx, msg, bytes, filename, &reason, &action_taken)
+        self.send_log(guild, ctx, msg, bytes, filename, &reason, &action_taken)
             .await;
     }
 
     async fn send_log(
         &self,
-        cfg: &Config,
+        guild: &GuildConfig,
         ctx: &Context,
         msg: &Message,
         bytes: &[u8],
@@ -361,7 +381,7 @@ impl Handler {
         reason: &DetectionReason,
         action_taken: &str,
     ) {
-        let log_channel_id = cfg.bot.log_channel_id;
+        let log_channel_id = guild.log_channel_id;
         if log_channel_id == 0 {
             return;
         }

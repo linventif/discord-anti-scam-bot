@@ -1,37 +1,21 @@
-# Configuration for the discord-anti-scam-bot bot.
-# The bot token does NOT go here: put it in the .env file (DISCORD_TOKEN=...).
+# Bot-wide configuration for discord-anti-scam-bot — the same for every server
+# the bot is in. Per-server settings (log channel, sanction, mod/exempt roles
+# and channels) are NOT here: they live in the database and are managed with
+# the /config slash command in each server, so multiple independent servers
+# using this bot don't share or overwrite each other's settings.
 #
-# Copy this file to config.toml and edit it — config.toml is gitignored so your
-# server-specific IDs (log channel, mod roles) never end up committed.
+# The bot token does NOT go here either: put it in the .env file (DISCORD_TOKEN=...).
+#
+# Copy this file to config.toml and edit it — config.toml is gitignored.
 
 [bot]
-# Prefix for moderation commands (!scam add, !scam list, !scam remove)
+# Prefix for the reference-management commands (!scam add, !scam list, !scam remove).
 prefix = "!scam"
-# Channel where the bot posts evidence for every detection (image, matched reference, score, action taken).
-# Set to 0 to disable logging.
-log_channel_id = 0
-# Roles allowed to manage reference images (!scam add / remove).
-# Leave empty = only members with the "Manage Messages" permission can use them.
-mod_role_ids = []
-
-[moderation]
-# Action applied when a sent image matches a known scam reference:
-#   "log_only"       -> only logs, no automatic sanction
-#   "delete_only"     -> deletes the message, no sanction on the account
-#   "delete_timeout"   -> deletes the message + times out the account (recommended)
-#   "delete_kick"      -> deletes the message + kicks the member
-#   "delete_ban"       -> deletes the message + bans the member
-action = "delete_timeout"
-# Timeout duration in minutes (used if action = "delete_timeout"). Discord max = 40320 (28 days).
-timeout_minutes = 1440
-
-# Roles exempt from any detection (e.g. "Staff", "Bot" role)
-exempt_role_ids = []
-# Channels exempt from detection (e.g. a test/archive channel where scam samples are shared on purpose)
-exempt_channel_ids = []
 
 [detection]
 # Folder containing reference images (screenshots of known compromised accounts).
+# Shared across every server the bot is in — a scam flagged on one server is
+# recognized on all of them.
 reference_dir = "reference"
 # Max Hamming distance (16x16 perceptual hash = 256 bits) below which a sent image is
 # considered a match against a reference.
@@ -40,8 +24,9 @@ reference_dir = "reference"
 match_threshold = 18
 
 # Flood detection: the same account posting the same image across several different
-# channels in a short time is a strong sign of a compromised account (cross-channel
-# auto-post), even if the image doesn't match any known reference yet.
+# channels of the same server in a short time is a strong sign of a compromised
+# account (cross-channel auto-post), even if the image doesn't match any known
+# reference yet.
 [flood]
 enabled = true
 # Minimum number of distinct channels hit by the same image to trigger the alert.
@@ -64,5 +49,6 @@ allowed_hosts = [
 ]
 
 [storage]
-# SQLite database used to persist flood-detection state across restarts.
+# SQLite database used to persist flood-detection state and per-server settings
+# across restarts.
 database_path = "data/bot.sqlite3"

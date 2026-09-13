@@ -8,15 +8,16 @@ pieces fit together, not the algorithms inside them.
 
 | Module | Responsibility |
 |---|---|
-| `main.rs` | Startup: load config, open the reference store and flood DB, build the Discord client, run it. |
-| `config.rs` | The `Config` struct tree (deserialized from `config.toml`) and the `Action` enum. |
-| `configstore.rs` | `ConfigStore`: holds the live `Config` behind a lock, and persists changes back to `config.toml` in place (via `toml_edit`, touching only the changed key). |
+| `main.rs` | Startup: load config, open the reference store / flood DB / guild-settings DB, build the Discord client, run it. |
+| `config.rs` | `Config` (bot-wide settings, from `config.toml`), `GuildConfig` (per-guild settings, with sensible defaults), and the `Action` enum. |
+| `configstore.rs` | `ConfigStore`: holds the live bot-wide `Config` behind a lock. Currently read-only at runtime — nothing in `Config` is editable via a command. |
+| `guildstore.rs` | `GuildSettingsStore`: the per-guild counterpart, backed by SQLite (`guild_settings` table) instead of a file, since there can be many guilds each with their own row. |
 | `handler.rs` | The `serenity::EventHandler` impl: `message` (the detection pipeline), `interaction_create` (dispatches to slash commands), `ready` (registers the global `/config` command). |
 | `hashstore.rs` | `ReferenceStore`: loads reference images, computes perceptual hashes (including crop-resistant variants), compares an incoming image against the set. |
-| `flood.rs` | `FloodDetector`: tracks recent image posts per user across channels in SQLite, to catch a compromised account cross-posting the same image everywhere. |
+| `flood.rs` | `FloodDetector`: tracks recent image posts per user across channels (scoped to one guild) in SQLite, to catch a compromised account cross-posting the same image everywhere. |
 | `linkimage.rs` | `LinkImageFetcher`: extracts allow-listed image URLs from message text and downloads them (following one `og:image` hop for HTML pages like imgur galleries). |
-| `slashconfig.rs` | Builds the `/config` command tree and handles both its execution and its autocomplete (the log-channel picker). |
-| `commands.rs` | The legacy `!scam add/list/remove` prefix commands for managing reference images. |
+| `slashconfig.rs` | Builds the `/config` command tree and handles both its execution and its autocomplete (the log-channel picker). Every setting it touches is per-guild. |
+| `commands.rs` | The legacy `!scam add/list/remove` prefix commands for managing reference images (shared across guilds, see "Multi-guild" below). |
 
 ## Data flow: a message arrives
 
@@ -55,16 +56,38 @@ Every attachment and every extracted link is hashed and checked independently; t
 that triggers a detection stops processing the rest of that message (see the `return`/`true`
 propagation in `message()` and `evaluate_image()`).
 
-## Config: read-mostly, written rarely
+## Multi-guild: bot-wide vs. per-guild settings
 
-`Handler` holds `config: Arc<ConfigStore>`. On every message, `message()` takes one
-`self.config.snapshot().await` (a cheap clone of the current `Config`) and uses that single
-snapshot for the rest of the handler call — so a `/config` change mid-processing of one message
-can't leave that call reading half-old, half-new values.
+This bot runs in more than one Discord server (guild) at once, and each server's admins expect
+their own independent settings — a log channel, sanction, and exempt roles/channels configured in
+Server A must never affect Server B. That split runs through the whole config layer:
 
-Writes (`ConfigStore::set_*` / `add_*` / `remove_*`) go the other way: update the in-memory
-`Config` *and* patch the specific key in `config.toml` via `toml_edit`, so the file's comments
-and everything else survive, and the value is still correct after a restart.
+- **Bot-wide** (`Config`, `config.toml`, `ConfigStore`): `bot.prefix`, `detection.*`, `flood.*`,
+  `links.*`, `storage.*`. Genuinely the same for every guild — these are operational/tuning knobs
+  for the deployment, not something an individual server's admin should be able to change (there's
+  no slash command exposing them).
+- **Per-guild** (`GuildConfig`, SQLite `guild_settings` table, `GuildSettingsStore`):
+  `log_channel_id`, `action`, `timeout_minutes`, `mod_role_ids`, `exempt_role_ids`,
+  `exempt_channel_ids`. Keyed by `guild_id`; an unconfigured guild gets `GuildConfig::default()`
+  until an admin runs `/config`. A single TOML file doesn't fit "one row per guild" well, hence
+  SQLite here instead of `config.toml` even though it's still "config".
+
+`Handler::message()` fetches both once per message — `self.config.snapshot().await` (bot-wide)
+and `self.guild_settings.get(guild_id.get()).await` (this guild's) — and passes them down
+together, so a `/config` change mid-processing of one message can't leave that call reading
+half-old, half-new values, and one guild's settings can never leak into another's.
+
+The **reference image set** (`reference/`) is the one deliberate exception: it's shared across
+every guild by design (see [DETECTION.md](DETECTION.md)) — a scam screenshot flagged via `!scam
+add` on one server is recognized on all of them, on the theory that a known scam template is a
+known scam template regardless of which server first saw it. `commands.rs`'s `!scam` commands are
+still guild-scoped for *authorization* (which mod role/Administrator can run them), just not for
+the data they operate on.
+
+`FloodDetector` is scoped by guild too (`flood_posts.guild_id`) for the same reason: without it, a
+user who happens to be a member of two of the bot's servers could trip a "cross-channel flood"
+alert by posting in unrelated channels of two *different* servers, which isn't the pattern this
+heuristic is meant to catch.
 
 ## Slash commands: global, not per-guild
 
@@ -80,11 +103,14 @@ command are typically much faster).
 
 - **Reference images** (`reference/`): plain files on disk, hashed on load and on `!scam add`.
   This *is* the persistence layer — no database involved.
-- **Flood-detection activity**: SQLite (`data/bot.sqlite3` by default), because it needs to
-  survive a restart but is otherwise a small, short-lived (`flood.window_seconds`) rolling log —
-  see [DETECTION.md](DETECTION.md#flood-detection) for the schema and why SQLite over a plain
-  in-memory map.
-- **Settings** (`config.toml`): see the "Config" section above.
+- **Flood-detection activity** and **per-guild settings**: both SQLite, both in
+  `data/bot.sqlite3` by default (two separate tables, two separate connections — see
+  `FloodDetector` and `GuildSettingsStore`). Flood data needs to survive a restart but is
+  otherwise a small, short-lived (`flood.window_seconds`) rolling log; see
+  [DETECTION.md](DETECTION.md#flood-detection) for its schema and why SQLite over a plain
+  in-memory map. Per-guild settings need SQLite for the more basic reason that "one row per
+  guild" doesn't map onto a single TOML file at all.
+- **Bot-wide settings** (`config.toml`): see "Multi-guild" above.
 
 None of these are a "server" the bot talks to over the network — everything lives on whatever
 host/container runs the bot, which is why `reference/`, `data/`, and `config.toml` are all

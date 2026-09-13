@@ -4,17 +4,17 @@ use anyhow::Result;
 use serenity::model::channel::Message;
 use serenity::prelude::*;
 
-use crate::config::Config;
+use crate::config::GuildConfig;
 use crate::handler::Handler;
 
 pub async fn handle_command(
     handler: &Handler,
-    cfg: &Config,
+    guild: &GuildConfig,
     ctx: &Context,
     msg: &Message,
     rest: &str,
 ) -> Result<()> {
-    if !is_authorized(cfg, ctx, msg).await {
+    if !is_authorized(guild, ctx, msg).await {
         return Ok(());
     }
 
@@ -38,15 +38,15 @@ pub async fn handle_command(
     Ok(())
 }
 
-async fn is_authorized(cfg: &Config, ctx: &Context, msg: &Message) -> bool {
+async fn is_authorized(guild: &GuildConfig, ctx: &Context, msg: &Message) -> bool {
     let Ok(member) = msg.member(ctx).await else {
         return false;
     };
-    if !cfg.bot.mod_role_ids.is_empty() {
+    if !guild.mod_role_ids.is_empty() {
         return member
             .roles
             .iter()
-            .any(|r| cfg.bot.mod_role_ids.contains(&r.get()));
+            .any(|r| guild.mod_role_ids.contains(&r.get()));
     }
     // Role-based check (ignores channel overwrites): good enough for a global
     // moderation command, and avoids having to resolve the GuildChannel.

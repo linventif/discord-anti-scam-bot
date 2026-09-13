@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serenity::all::*;
 
-use crate::config::{Action, Config};
+use crate::config::{Action, Config, GuildConfig};
 use crate::handler::Handler;
 
 /// Builds the `/config` command tree: flat subcommands for single-value settings,
@@ -9,6 +9,9 @@ use crate::handler::Handler;
 /// lists. Role options and `action` get Discord's native picker/choice UI; the log
 /// channel uses autocomplete instead of the native channel picker so we can only
 /// ever suggest channels the bot can actually post in (see `handle_config_autocomplete`).
+///
+/// Every setting here is per-guild (see `guildstore.rs`) — running this in one
+/// server never touches another server's settings.
 pub fn build_config_command() -> CreateCommand {
     CreateCommand::new("config")
         .description("View or change discord-anti-scam-bot settings for this server")
@@ -120,13 +123,19 @@ pub async fn handle_config_command(
     ctx: &Context,
     command: &CommandInteraction,
 ) -> Result<()> {
-    let cfg = handler.config.snapshot().await;
+    let Some(guild_id) = command.guild_id else {
+        return reply(ctx, command, "This command only works in a server.").await;
+    };
 
-    let text = if !is_authorized(&cfg, command) {
-        "You need to be a server **Administrator** (or have a role listed in `mod_role_ids`) to change this bot's settings."
+    let guild = handler.guild_settings.get(guild_id.get()).await;
+
+    let text = if !is_authorized(&guild, command) {
+        "You need to be a server **Administrator** (or have a role listed in this server's \
+         `mod_role_ids`) to change this bot's settings."
             .to_string()
     } else {
-        match run(handler, &cfg, ctx, command).await {
+        let cfg = handler.config.snapshot().await;
+        match run(handler, &cfg, &guild, guild_id, ctx, command).await {
             Ok(text) => text,
             Err(e) => {
                 tracing::warn!("/config command failed: {e:#}");
@@ -135,6 +144,10 @@ pub async fn handle_config_command(
         }
     };
 
+    reply(ctx, command, &text).await
+}
+
+async fn reply(ctx: &Context, command: &CommandInteraction, text: &str) -> Result<()> {
     command
         .create_response(
             &ctx.http,
@@ -146,12 +159,12 @@ pub async fn handle_config_command(
     Ok(())
 }
 
-fn is_authorized(cfg: &Config, command: &CommandInteraction) -> bool {
+fn is_authorized(guild: &GuildConfig, command: &CommandInteraction) -> bool {
     let Some(member) = command.member.as_ref() else {
         return false;
     };
-    if !cfg.bot.mod_role_ids.is_empty() {
-        return member.roles.iter().any(|r| cfg.bot.mod_role_ids.contains(&r.get()));
+    if !guild.mod_role_ids.is_empty() {
+        return member.roles.iter().any(|r| guild.mod_role_ids.contains(&r.get()));
     }
     // Discord's own default_member_permissions on the command already restricts
     // who can even see/use it, but a server admin can loosen that in Integration
@@ -159,15 +172,19 @@ fn is_authorized(cfg: &Config, command: &CommandInteraction) -> bool {
     member.permissions.map(|p| p.administrator()).unwrap_or(false)
 }
 
-async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandInteraction) -> Result<String> {
-    let Some(guild_id) = command.guild_id else {
-        return Ok("This command only works in a server.".to_string());
-    };
-
+async fn run(
+    handler: &Handler,
+    cfg: &Config,
+    guild: &GuildConfig,
+    guild_id: GuildId,
+    ctx: &Context,
+    command: &CommandInteraction,
+) -> Result<String> {
     let options = command.data.options();
     let Some(top) = options.first() else {
         return Ok("Missing subcommand.".to_string());
     };
+    let gid = guild_id.get();
 
     Ok(match (top.name, &top.value) {
         ("log-channel", ResolvedValue::SubCommand(sub)) => {
@@ -177,7 +194,7 @@ async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandIn
 
             match check_bot_can_post(ctx, guild_id, ChannelId::new(channel_id)).await {
                 Ok(None) => {
-                    handler.config.set_log_channel(channel_id).await?;
+                    handler.guild_settings.set_log_channel(gid, channel_id).await?;
                     format!("Log channel set to <#{channel_id}>.")
                 }
                 Ok(Some(problem)) => format!(
@@ -190,7 +207,7 @@ async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandIn
 
         ("action", ResolvedValue::SubCommand(sub)) => match find_string(sub).and_then(Action::from_toml_str) {
             Some(action) => {
-                handler.config.set_action(action).await?;
+                handler.guild_settings.set_action(gid, action).await?;
                 let mut reply = format!("Action set to `{}`.", action.as_toml_str());
                 if let Some(missing) = missing_permission_for(action) {
                     if let Ok(false) = bot_has_guild_permission(ctx, guild_id, missing).await {
@@ -208,21 +225,21 @@ async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandIn
 
         ("timeout-minutes", ResolvedValue::SubCommand(sub)) => match find_integer(sub) {
             Some(minutes) if minutes > 0 => {
-                handler.config.set_timeout_minutes(minutes as u64).await?;
+                handler.guild_settings.set_timeout_minutes(gid, minutes as u64).await?;
                 format!("Timeout duration set to {minutes} minute(s).")
             }
             _ => "Invalid duration.".to_string(),
         },
 
-        ("show", _) => build_show_text(cfg),
+        ("show", _) => build_show_text(cfg, guild),
 
         ("mod-role", ResolvedValue::SubCommandGroup(group)) => match find_role_action(group) {
             Some(("add", role_id)) => {
-                let added = handler.config.add_mod_role(role_id).await?;
+                let added = handler.guild_settings.add_mod_role(gid, role_id).await?;
                 role_reply(role_id, added, "is now allowed to manage this bot", "already had access")
             }
             Some(("remove", role_id)) => {
-                let removed = handler.config.remove_mod_role(role_id).await?;
+                let removed = handler.guild_settings.remove_mod_role(gid, role_id).await?;
                 role_reply(role_id, removed, "can no longer manage this bot", "didn't have access")
             }
             _ => "Missing role option.".to_string(),
@@ -230,11 +247,11 @@ async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandIn
 
         ("exempt-role", ResolvedValue::SubCommandGroup(group)) => match find_role_action(group) {
             Some(("add", role_id)) => {
-                let added = handler.config.add_exempt_role(role_id).await?;
+                let added = handler.guild_settings.add_exempt_role(gid, role_id).await?;
                 role_reply(role_id, added, "is now exempt from detection", "was already exempt")
             }
             Some(("remove", role_id)) => {
-                let removed = handler.config.remove_exempt_role(role_id).await?;
+                let removed = handler.guild_settings.remove_exempt_role(gid, role_id).await?;
                 role_reply(role_id, removed, "is no longer exempt", "wasn't exempt")
             }
             _ => "Missing role option.".to_string(),
@@ -242,11 +259,11 @@ async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandIn
 
         ("exempt-channel", ResolvedValue::SubCommandGroup(group)) => match find_channel_action(group) {
             Some(("add", channel_id)) => {
-                let added = handler.config.add_exempt_channel(channel_id).await?;
+                let added = handler.guild_settings.add_exempt_channel(gid, channel_id).await?;
                 channel_reply(channel_id, added, "is now exempt from detection", "was already exempt")
             }
             Some(("remove", channel_id)) => {
-                let removed = handler.config.remove_exempt_channel(channel_id).await?;
+                let removed = handler.guild_settings.remove_exempt_channel(gid, channel_id).await?;
                 channel_reply(channel_id, removed, "is no longer exempt", "wasn't exempt")
             }
             _ => "Missing channel option.".to_string(),
@@ -442,30 +459,32 @@ fn channel_reply(channel_id: u64, changed: bool, did: &str, already: &str) -> St
     }
 }
 
-fn build_show_text(cfg: &Config) -> String {
-    let log_channel = if cfg.bot.log_channel_id == 0 {
+fn build_show_text(cfg: &Config, guild: &GuildConfig) -> String {
+    let log_channel = if guild.log_channel_id == 0 {
         "disabled".to_string()
     } else {
-        format!("<#{}>", cfg.bot.log_channel_id)
+        format!("<#{}>", guild.log_channel_id)
     };
 
-    let mod_roles = format_role_list(&cfg.bot.mod_role_ids);
-    let exempt_roles = format_role_list(&cfg.moderation.exempt_role_ids);
-    let exempt_channels = format_channel_list(&cfg.moderation.exempt_channel_ids);
+    let mod_roles = format_role_list(&guild.mod_role_ids);
+    let exempt_roles = format_role_list(&guild.exempt_role_ids);
+    let exempt_channels = format_channel_list(&guild.exempt_channel_ids);
 
     format!(
-        "**Current settings**\n\
+        "**Current settings for this server**\n\
          - Action: `{}`\n\
          - Timeout duration: {} minute(s)\n\
          - Log channel: {log_channel}\n\
          - Mod roles: {mod_roles}\n\
          - Exempt roles: {exempt_roles}\n\
          - Exempt channels: {exempt_channels}\n\
+         \n\
+         **Bot-wide settings** (same for every server the bot is in)\n\
          - Match threshold: {} (hash distance)\n\
          - Flood detection: {} (min {} channels within {}s)\n\
          - Link images: {} ({} allow-listed host(s))",
-        cfg.moderation.action.as_toml_str(),
-        cfg.moderation.timeout_minutes,
+        guild.action.as_toml_str(),
+        guild.timeout_minutes,
         cfg.detection.match_threshold,
         if cfg.flood.enabled { "on" } else { "off" },
         cfg.flood.min_channels,

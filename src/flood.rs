@@ -5,13 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use image_hasher::ImageHash;
 use rusqlite::Connection;
-use serenity::model::id::{ChannelId, UserId};
+use serenity::model::id::{ChannelId, GuildId, UserId};
 use tokio::sync::Mutex;
 
 /// Detects a strong sign of a compromised account: the same user posting the
 /// same image (even if it doesn't match any known reference) across several
-/// different channels in a short time — typical of a self-bot/webhook blasting
-/// a scam everywhere it has access to.
+/// different channels **of the same guild** in a short time — typical of a
+/// self-bot/webhook blasting a scam everywhere it has access to. Scoped by
+/// guild so a user who happens to be in several of the bot's servers doesn't
+/// get flagged for posting in two unrelated servers.
 ///
 /// Backed by SQLite (instead of an in-memory map) so this survives a bot restart:
 /// a scammer's post history a moment before a redeploy shouldn't be forgotten.
@@ -49,10 +51,23 @@ impl FloodDetector {
                 channel_id TEXT NOT NULL,
                 hash TEXT NOT NULL,
                 ts INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_flood_posts_user_ts ON flood_posts(user_id, ts);",
+            );",
         )
         .context("could not initialize flood_posts table")?;
+
+        // Migrate a pre-multi-guild database (this table used to have no
+        // guild_id column at all). Fails harmlessly with "duplicate column"
+        // on a table that already has it — including one just created above.
+        let _ = conn.execute(
+            "ALTER TABLE flood_posts ADD COLUMN guild_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_flood_posts_guild_user_ts
+                ON flood_posts(guild_id, user_id, ts);",
+        )
+        .context("could not create flood_posts index")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -62,10 +77,12 @@ impl FloodDetector {
         })
     }
 
-    /// Records an image post and returns the number of distinct channels hit by
-    /// (a variant of) this same image if the flood threshold is exceeded.
+    /// Records an image post and returns the number of distinct channels (within
+    /// the same guild) hit by (a variant of) this same image if the flood
+    /// threshold is exceeded.
     pub async fn record_and_check(
         &self,
+        guild: GuildId,
         user: UserId,
         channel: ChannelId,
         hash: ImageHash,
@@ -75,6 +92,7 @@ impl FloodDetector {
             .unwrap()
             .as_secs() as i64;
         let cutoff = now - self.window_seconds;
+        let guild_id = guild.get().to_string();
         let user_id = user.get().to_string();
         let channel_id = channel.get().to_string();
         let hash_b64 = hash.to_base64();
@@ -86,16 +104,16 @@ impl FloodDetector {
         }
 
         if let Err(e) = conn.execute(
-            "INSERT INTO flood_posts (user_id, channel_id, hash, ts) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![user_id, channel_id, hash_b64, now],
+            "INSERT INTO flood_posts (guild_id, user_id, channel_id, hash, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![guild_id, user_id, channel_id, hash_b64, now],
         ) {
             tracing::warn!("flood db insert failed: {e}");
             return None;
         }
 
-        let mut stmt = match conn
-            .prepare("SELECT channel_id, hash FROM flood_posts WHERE user_id = ?1 AND ts >= ?2")
-        {
+        let mut stmt = match conn.prepare(
+            "SELECT channel_id, hash FROM flood_posts WHERE guild_id = ?1 AND user_id = ?2 AND ts >= ?3",
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("flood db query failed: {e}");
@@ -103,7 +121,7 @@ impl FloodDetector {
             }
         };
 
-        let rows = match stmt.query_map(rusqlite::params![user_id, cutoff], |row| {
+        let rows = match stmt.query_map(rusqlite::params![guild_id, user_id, cutoff], |row| {
             let channel_id: String = row.get(0)?;
             let hash: String = row.get(1)?;
             Ok((channel_id, hash))
@@ -184,38 +202,62 @@ mod tests {
     #[tokio::test]
     async fn flags_the_same_image_across_enough_channels() {
         let flood = FloodDetector::open(":memory:", 60, 6, 3).expect("open in-memory db");
+        let guild = GuildId::new(1);
         let user = UserId::new(1);
         let hash = solid_color_hash(128);
 
         assert!(flood
-            .record_and_check(user, ChannelId::new(1), hash.clone())
+            .record_and_check(guild, user, ChannelId::new(1), hash.clone())
             .await
             .is_none());
         assert!(flood
-            .record_and_check(user, ChannelId::new(2), hash.clone())
+            .record_and_check(guild, user, ChannelId::new(2), hash.clone())
             .await
             .is_none());
-        let result = flood
-            .record_and_check(user, ChannelId::new(3), hash)
-            .await;
+        let result = flood.record_and_check(guild, user, ChannelId::new(3), hash).await;
         assert_eq!(result, Some(3));
     }
 
     #[tokio::test]
     async fn ignores_different_images_across_channels() {
         let flood = FloodDetector::open(":memory:", 60, 6, 3).expect("open in-memory db");
+        let guild = GuildId::new(1);
         let user = UserId::new(1);
 
         assert!(flood
-            .record_and_check(user, ChannelId::new(1), noise_hash(1))
+            .record_and_check(guild, user, ChannelId::new(1), noise_hash(1))
             .await
             .is_none());
         assert!(flood
-            .record_and_check(user, ChannelId::new(2), noise_hash(2))
+            .record_and_check(guild, user, ChannelId::new(2), noise_hash(2))
             .await
             .is_none());
         assert!(flood
-            .record_and_check(user, ChannelId::new(3), noise_hash(3))
+            .record_and_check(guild, user, ChannelId::new(3), noise_hash(3))
+            .await
+            .is_none());
+    }
+
+    /// The same user posting in 3 channels that happen to be spread across two
+    /// *different* guilds must not be flagged — that's not cross-channel
+    /// flooding of one server, just someone in two unrelated servers.
+    #[tokio::test]
+    async fn does_not_flag_across_different_guilds() {
+        let flood = FloodDetector::open(":memory:", 60, 6, 3).expect("open in-memory db");
+        let user = UserId::new(1);
+        let hash = solid_color_hash(128);
+
+        assert!(flood
+            .record_and_check(GuildId::new(1), user, ChannelId::new(1), hash.clone())
+            .await
+            .is_none());
+        assert!(flood
+            .record_and_check(GuildId::new(1), user, ChannelId::new(2), hash.clone())
+            .await
+            .is_none());
+        // Third post is in guild 2, not guild 1 — must not complete the guild-1 flood.
+        assert!(flood
+            .record_and_check(GuildId::new(2), user, ChannelId::new(3), hash)
             .await
             .is_none());
     }
@@ -228,24 +270,54 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&db_path);
 
+        let guild = GuildId::new(1);
         let user = UserId::new(42);
         let hash = solid_color_hash(200);
 
         {
             let flood = FloodDetector::open(&db_path, 60, 6, 3).expect("open db");
-            flood
-                .record_and_check(user, ChannelId::new(1), hash.clone())
-                .await;
-            flood
-                .record_and_check(user, ChannelId::new(2), hash.clone())
-                .await;
+            flood.record_and_check(guild, user, ChannelId::new(1), hash.clone()).await;
+            flood.record_and_check(guild, user, ChannelId::new(2), hash.clone()).await;
         } // "restart": the FloodDetector (and its connection) is dropped here.
 
         let flood = FloodDetector::open(&db_path, 60, 6, 3).expect("reopen db");
-        let result = flood
-            .record_and_check(user, ChannelId::new(3), hash)
-            .await;
+        let result = flood.record_and_check(guild, user, ChannelId::new(3), hash).await;
         assert_eq!(result, Some(3), "flood history should persist across a restart");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Regression test: opening a database created by a pre-multi-guild build
+    /// (whose `flood_posts` table has no `guild_id` column at all) must not
+    /// fail — this exact scenario broke a real deployment once.
+    #[tokio::test]
+    async fn opens_a_pre_multi_guild_database() {
+        let db_path = std::env::temp_dir().join(format!(
+            "discord_anti_scam_bot_flood_migration_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        {
+            let conn = Connection::open(&db_path).expect("create old-schema db");
+            conn.execute_batch(
+                "CREATE TABLE flood_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    ts INTEGER NOT NULL
+                );",
+            )
+            .expect("create old flood_posts table");
+        }
+
+        // Must open (and add the missing column) without erroring.
+        let flood = FloodDetector::open(&db_path, 60, 6, 3).expect("open pre-migration db");
+        let result = flood
+            .record_and_check(GuildId::new(1), UserId::new(1), ChannelId::new(1), solid_color_hash(1))
+            .await;
+        assert_eq!(result, None);
 
         let _ = std::fs::remove_file(&db_path);
     }

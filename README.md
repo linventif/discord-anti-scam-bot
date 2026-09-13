@@ -2,7 +2,9 @@
 
 A Discord bot (Rust / serenity) that scans every image posted on a server at scale to detect
 screenshots from compromised accounts (Nitro/crypto scams mass-reposted), automatically deletes
-the offending messages, and sanctions the account according to config.
+the offending messages, and sanctions the account according to config. Built to run in multiple
+servers at once, each with its own independent settings — see [Per-server
+settings](#per-server-settings-config-above) below.
 
 ## How it works
 
@@ -16,8 +18,9 @@ the offending messages, and sanctions the account according to config.
    short time (typical of a compromised account spamming everywhere it has access to), it's
    flagged even if the image isn't in the reference set yet. This activity is persisted to
    SQLite, so it survives a bot restart.
-4. Based on `config.toml`, the bot deletes the message and applies (or not) a sanction: timeout,
-   kick, or ban. Every detection is logged to a dedicated channel with evidence (image, matched
+4. Based on that server's `/config` settings, the bot deletes the message and applies (or not) a
+   sanction: timeout, kick, or ban. Every detection is logged to that server's own dedicated
+   channel with evidence (image, matched
    reference, score, action taken).
 
 ## Invite the bot
@@ -45,8 +48,10 @@ cp .env.example .env
 # edit .env and set your DISCORD_TOKEN
 
 cp config.example.toml config.toml
-# edit config.toml: at least set bot.log_channel_id, and moderation.action once you're
-# done testing (config.toml is gitignored, so your own settings never get committed)
+# edit config.toml for bot-wide settings (detection sensitivity, flood tuning, allow-listed
+# link hosts...) — config.toml is gitignored, so your own values never get committed.
+# Per-server settings (log channel, sanction, mod/exempt roles) are NOT in this file: set
+# those with /config once the bot is running and invited to your server(s).
 
 cargo build --release
 ```
@@ -97,13 +102,16 @@ so regressions get caught before they reach a release.
 
 ## Moderation commands (in Discord)
 
-Restricted to members with a role listed in `mod_role_ids` (config.toml), or by default to
-anyone with the `Manage Messages` permission.
+Restricted to members with a role listed in this server's `mod_role_ids` (see `/config mod-role`
+below), or by default to anyone with the `Manage Messages` permission.
 
 - `!scam add` — attach one or more images to the message: adds them as new scam references
   (useful whenever a moderator spots a new screenshot that isn't known yet).
 - `!scam list` — lists the reference files currently in memory.
 - `!scam remove <file>` — removes a reference (filename as shown by `list`).
+
+The reference set itself is shared across every server the bot is in (a scam flagged on one
+server is recognized on all of them) — only who's *allowed to manage it* is checked per-server.
 
 ## `/config` slash command
 
@@ -112,8 +120,11 @@ invited to without any extra step — including after being removed and re-added
 Global command registration/updates can take up to about an hour to fully propagate to every
 client, so don't be surprised if it's not instant right after a first deploy.
 
-Change settings live from Discord — no editing `config.toml` or restarting by hand. Requires
-being a server **Administrator** (or having a role listed in `mod_role_ids`); Discord's UI also
+Every setting `/config` touches is **specific to the server you run it in** — running it in one
+server never reads or changes another server's settings (see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#multi-guild-bot-wide-vs-per-guild-settings)). Change
+settings live from Discord — no editing files or restarting by hand. Requires being a server
+**Administrator** (or having a role listed in this server's `mod_role_ids`); Discord's UI also
 hides the command entirely from members without that permission. All replies are ephemeral
 (visible only to whoever ran the command). Role options use Discord's native picker, and `action`
 uses a fixed choice list, so there's nothing to type or get wrong.
@@ -129,25 +140,29 @@ uses a fixed choice list, so there's nothing to type or get wrong.
 - `/config mod-role add|remove @role`
 - `/config exempt-role add|remove @role`
 - `/config exempt-channel add|remove #channel`
-- `/config show` — prints the current settings
+- `/config show` — prints this server's current settings
 
-Every change is written to `config.toml` immediately (only the touched key — comments and the
-rest of the file are left alone), so it survives a restart or redeploy, and takes effect right
-away without one.
+Every change is written to the database immediately, so it survives a restart or redeploy, and
+takes effect right away without one.
 
-## Key settings (`config.toml`)
+## Per-server settings (`/config`, above)
 
-- `moderation.action`: `log_only` / `delete_only` / `delete_timeout` (default) /
-  `delete_kick` / `delete_ban`.
-- `moderation.timeout_minutes`: timeout duration (max 40320 = 28 days, Discord's limit).
+- `action`: `log_only` / `delete_only` / `delete_timeout` (default) / `delete_kick` /
+  `delete_ban`.
+- `timeout_minutes`: timeout duration (max 40320 = 28 days, Discord's limit).
+- `log_channel_id`: channel where detection evidence gets posted (0/unset = disabled).
+- `mod_role_ids`: who besides Administrators can use `/config` and `!scam add/list/remove`.
+- `exempt_role_ids` / `exempt_channel_ids`: roles/channels to ignore.
+
+## Bot-wide settings (`config.toml`, same for every server)
+
 - `detection.match_threshold`: image comparison sensitivity (lower = stricter).
 - `flood.*`: cross-channel flood detection settings.
-- `bot.log_channel_id`: channel where detection evidence gets posted (0 = disabled).
-- `bot.exempt_role_ids` / `moderation.exempt_channel_ids`: roles/channels to ignore.
 - `links.enabled` / `links.allowed_hosts`: fetch and check images posted as plain links (not
   just attachments) from these hosts only. The bot never fetches an arbitrary URL found in a
   message — only hosts on this list — to avoid becoming an open URL-fetching proxy.
-- `storage.database_path`: where the SQLite flood-detection database lives.
+- `storage.database_path`: where the SQLite database (flood-detection state + per-server
+  settings) lives.
 
 ## Known limitations (v1)
 
