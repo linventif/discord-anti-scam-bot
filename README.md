@@ -35,6 +35,8 @@ Required permissions for the bot's role on the server (placed above regular memb
 - `Moderate Members` (timeout)
 - `Kick Members` / `Ban Members` if you use `delete_kick` / `delete_ban`
 - `View Channels` / `Read Message History` on the channels to monitor
+- `View Channels`, `Send Messages`, `Embed Links`, `Attach Files` on the log channel (checked
+  live by `/config log-channel`, which only ever suggests channels that already have these)
 
 ## Install
 
@@ -88,13 +90,19 @@ anyone with the `Manage Messages` permission.
 
 ## `/config` slash command
 
-Change settings live from Discord — no editing `config.toml` or restarting by hand. Requires the
-**Manage Messages** permission (or a role listed in `mod_role_ids`); Discord's UI also hides the
-command entirely from members without that permission. Channel and role options use Discord's
-native picker, and `action` uses a fixed choice list, so there's nothing to type or get wrong.
+Change settings live from Discord — no editing `config.toml` or restarting by hand. Requires
+being a server **Administrator** (or having a role listed in `mod_role_ids`); Discord's UI also
+hides the command entirely from members without that permission. All replies are ephemeral
+(visible only to whoever ran the command). Role options use Discord's native picker, and `action`
+uses a fixed choice list, so there's nothing to type or get wrong.
 
-- `/config log-channel #channel`
-- `/config action <value>`
+- `/config log-channel <channel>` — the channel option is autocomplete-driven and only ever
+  suggests channels the bot can actually post in (View Channel + Send Messages). If you still
+  manage to target one it can't fully use (missing Embed Links / Attach Files), it tells you
+  exactly what's missing instead of silently failing later.
+- `/config action <value>` — if the chosen action needs a permission the bot doesn't have on this
+  server (Moderate Members / Kick Members / Ban Members), the reply warns you immediately instead
+  of only failing at detection time.
 - `/config timeout-minutes <minutes>`
 - `/config mod-role add|remove @role`
 - `/config exempt-role add|remove @role`

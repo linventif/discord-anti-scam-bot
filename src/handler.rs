@@ -66,12 +66,18 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Command(command) = interaction {
-            if command.data.name == "config" {
+        match interaction {
+            Interaction::Command(command) if command.data.name == "config" => {
                 if let Err(e) = crate::slashconfig::handle_config_command(self, &ctx, &command).await {
                     tracing::warn!("error responding to /config: {e:#}");
                 }
             }
+            Interaction::Autocomplete(command) if command.data.name == "config" => {
+                if let Err(e) = crate::slashconfig::handle_config_autocomplete(&ctx, &command).await {
+                    tracing::warn!("error responding to /config autocomplete: {e:#}");
+                }
+            }
+            _ => {}
         }
     }
 

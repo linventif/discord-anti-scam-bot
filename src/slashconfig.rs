@@ -1,17 +1,18 @@
 use anyhow::Result;
 use serenity::all::*;
 
-use crate::config::Action;
+use crate::config::{Action, Config};
 use crate::handler::Handler;
 
 /// Builds the `/config` command tree: flat subcommands for single-value settings,
 /// and a subcommand group (`add`/`remove`) for each of the three role/channel
-/// lists. Channel and role options get Discord's native picker UI; `action` gets
-/// a fixed choice list — no custom autocomplete plumbing needed for either.
+/// lists. Role options and `action` get Discord's native picker/choice UI; the log
+/// channel uses autocomplete instead of the native channel picker so we can only
+/// ever suggest channels the bot can actually post in (see `handle_config_autocomplete`).
 pub fn build_config_command() -> CreateCommand {
     CreateCommand::new("config")
         .description("View or change discord-anti-scam-bot settings for this server")
-        .default_member_permissions(Permissions::MANAGE_MESSAGES)
+        .default_member_permissions(Permissions::ADMINISTRATOR)
         .add_option(
             CreateCommandOption::new(
                 CommandOptionType::SubCommand,
@@ -19,8 +20,13 @@ pub fn build_config_command() -> CreateCommand {
                 "Channel where detection evidence gets posted",
             )
             .add_sub_option(
-                CreateCommandOption::new(CommandOptionType::Channel, "channel", "The log channel")
-                    .required(true),
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "channel",
+                    "Only channels I can actually post in are suggested",
+                )
+                .required(true)
+                .set_autocomplete(true),
             ),
         )
         .add_option(
@@ -114,11 +120,13 @@ pub async fn handle_config_command(
     ctx: &Context,
     command: &CommandInteraction,
 ) -> Result<()> {
-    let text = if !is_authorized(command) {
-        "You need the **Manage Messages** permission (or a configured mod role) to change this bot's settings."
+    let cfg = handler.config.snapshot().await;
+
+    let text = if !is_authorized(&cfg, command) {
+        "You need to be a server **Administrator** (or have a role listed in `mod_role_ids`) to change this bot's settings."
             .to_string()
     } else {
-        match run(handler, command).await {
+        match run(handler, &cfg, ctx, command).await {
             Ok(text) => text,
             Err(e) => {
                 tracing::warn!("/config command failed: {e:#}");
@@ -138,37 +146,62 @@ pub async fn handle_config_command(
     Ok(())
 }
 
-fn is_authorized(command: &CommandInteraction) -> bool {
+fn is_authorized(cfg: &Config, command: &CommandInteraction) -> bool {
+    let Some(member) = command.member.as_ref() else {
+        return false;
+    };
+    if !cfg.bot.mod_role_ids.is_empty() {
+        return member.roles.iter().any(|r| cfg.bot.mod_role_ids.contains(&r.get()));
+    }
     // Discord's own default_member_permissions on the command already restricts
     // who can even see/use it, but a server admin can loosen that in Integration
     // Settings — so this is a defense-in-depth check, not the only gate.
-    command
-        .member
-        .as_ref()
-        .and_then(|m| m.permissions)
-        .map(|p| p.manage_messages())
-        .unwrap_or(false)
+    member.permissions.map(|p| p.administrator()).unwrap_or(false)
 }
 
-async fn run(handler: &Handler, command: &CommandInteraction) -> Result<String> {
+async fn run(handler: &Handler, cfg: &Config, ctx: &Context, command: &CommandInteraction) -> Result<String> {
+    let Some(guild_id) = command.guild_id else {
+        return Ok("This command only works in a server.".to_string());
+    };
+
     let options = command.data.options();
     let Some(top) = options.first() else {
         return Ok("Missing subcommand.".to_string());
     };
 
     Ok(match (top.name, &top.value) {
-        ("log-channel", ResolvedValue::SubCommand(sub)) => match find_channel(sub) {
-            Some(id) => {
-                handler.config.set_log_channel(id).await?;
-                format!("Log channel set to <#{id}>.")
+        ("log-channel", ResolvedValue::SubCommand(sub)) => {
+            let Some(channel_id) = find_string(sub).and_then(|s| s.parse::<u64>().ok()) else {
+                return Ok("Missing or invalid channel option.".to_string());
+            };
+
+            match check_bot_can_post(ctx, guild_id, ChannelId::new(channel_id)).await {
+                Ok(None) => {
+                    handler.config.set_log_channel(channel_id).await?;
+                    format!("Log channel set to <#{channel_id}>.")
+                }
+                Ok(Some(problem)) => format!(
+                    "I can't use <#{channel_id}> as the log channel: {problem} \
+                     Fix my permissions there (or pick another channel) and try again."
+                ),
+                Err(e) => format!("Couldn't check my permissions in <#{channel_id}>: {e}"),
             }
-            None => "Missing channel option.".to_string(),
-        },
+        }
 
         ("action", ResolvedValue::SubCommand(sub)) => match find_string(sub).and_then(Action::from_toml_str) {
             Some(action) => {
                 handler.config.set_action(action).await?;
-                format!("Action set to `{}`.", action.as_toml_str())
+                let mut reply = format!("Action set to `{}`.", action.as_toml_str());
+                if let Some(missing) = missing_permission_for(action) {
+                    if let Ok(false) = bot_has_guild_permission(ctx, guild_id, missing).await {
+                        reply.push_str(&format!(
+                            "\n⚠️ I don't currently have the **{}** permission on this server, \
+                             so this action will fail until you grant it to my role.",
+                            permission_name(missing)
+                        ));
+                    }
+                }
+                reply
             }
             None => "Invalid action value.".to_string(),
         },
@@ -181,7 +214,7 @@ async fn run(handler: &Handler, command: &CommandInteraction) -> Result<String> 
             _ => "Invalid duration.".to_string(),
         },
 
-        ("show", _) => build_show_text(&handler.config.snapshot().await),
+        ("show", _) => build_show_text(cfg),
 
         ("mod-role", ResolvedValue::SubCommandGroup(group)) => match find_role_action(group) {
             Some(("add", role_id)) => {
@@ -223,16 +256,131 @@ async fn run(handler: &Handler, command: &CommandInteraction) -> Result<String> 
     })
 }
 
-fn find_channel(sub: &[ResolvedOption]) -> Option<u64> {
-    sub.iter().find_map(|o| match o.value {
-        ResolvedValue::Channel(c) => Some(c.id.get()),
-        _ => None,
-    })
+/// Responds to autocomplete requests for the `log-channel channel` option: only
+/// text channels the bot can actually send messages in, matching what's typed.
+pub async fn handle_config_autocomplete(ctx: &Context, command: &CommandInteraction) -> Result<()> {
+    let options = command.data.options();
+    let typed = options
+        .first()
+        .and_then(|top| match &top.value {
+            ResolvedValue::SubCommand(sub) if top.name == "log-channel" => {
+                sub.iter().find_map(|o| match o.value {
+                    ResolvedValue::Autocomplete { value, .. } => Some(value),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or("");
+
+    let choices = match command.guild_id {
+        Some(guild_id) => postable_channels(ctx, guild_id, typed).await,
+        None => Vec::new(),
+    };
+
+    let mut response = CreateAutocompleteResponse::new();
+    for (name, id) in choices {
+        response = response.add_string_choice(name, id);
+    }
+
+    command
+        .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
+        .await?;
+    Ok(())
+}
+
+async fn postable_channels(ctx: &Context, guild_id: GuildId, typed: &str) -> Vec<(String, String)> {
+    let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
+        return Vec::new();
+    };
+    let bot_id = ctx.cache.current_user().id;
+    let Ok(bot_member) = guild_id.member(&ctx.http, bot_id).await else {
+        return Vec::new();
+    };
+
+    let typed_lower = typed.to_lowercase();
+    let mut matches: Vec<(String, String)> = guild
+        .channels
+        .values()
+        .filter(|c| matches!(c.kind, ChannelType::Text | ChannelType::News))
+        .filter(|c| guild.user_permissions_in(c, &bot_member).send_messages())
+        .filter(|c| typed.is_empty() || c.name.to_lowercase().contains(&typed_lower))
+        .map(|c| (format!("#{}", c.name), c.id.get().to_string()))
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches.truncate(25); // Discord's own limit on autocomplete choices.
+    matches
+}
+
+/// Checks whether the bot can actually do its job (send messages, embed the
+/// evidence, attach the flagged image) in a candidate log channel. Returns
+/// `Ok(None)` if all good, `Ok(Some(explanation))` if something's missing.
+async fn check_bot_can_post(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Result<Option<String>> {
+    let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
+        return Ok(Some("I couldn't find this server in my cache.".to_string()));
+    };
+    let Some(channel) = guild.channels.get(&channel_id).cloned() else {
+        return Ok(Some("that channel doesn't exist (or isn't a text channel) in this server.".to_string()));
+    };
+    let bot_id = ctx.cache.current_user().id;
+    let bot_member = guild_id.member(&ctx.http, bot_id).await?;
+    let perms = guild.user_permissions_in(&channel, &bot_member);
+
+    let mut missing = Vec::new();
+    if !perms.view_channel() {
+        missing.push("View Channel");
+    }
+    if !perms.send_messages() {
+        missing.push("Send Messages");
+    }
+    if !perms.embed_links() {
+        missing.push("Embed Links");
+    }
+    if !perms.attach_files() {
+        missing.push("Attach Files");
+    }
+
+    if missing.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!("I'm missing: **{}**.", missing.join(", "))))
+    }
+}
+
+fn missing_permission_for(action: Action) -> Option<Permissions> {
+    match action {
+        Action::DeleteTimeout => Some(Permissions::MODERATE_MEMBERS),
+        Action::DeleteKick => Some(Permissions::KICK_MEMBERS),
+        Action::DeleteBan => Some(Permissions::BAN_MEMBERS),
+        Action::LogOnly | Action::DeleteOnly => None,
+    }
+}
+
+fn permission_name(perm: Permissions) -> &'static str {
+    if perm.contains(Permissions::MODERATE_MEMBERS) {
+        "Moderate Members"
+    } else if perm.contains(Permissions::KICK_MEMBERS) {
+        "Kick Members"
+    } else if perm.contains(Permissions::BAN_MEMBERS) {
+        "Ban Members"
+    } else {
+        "required"
+    }
+}
+
+/// Guild-wide permission check (timeout/kick/ban aren't channel-scoped, so
+/// channel overwrites don't apply — a plain role-based check is correct here).
+#[allow(deprecated)]
+async fn bot_has_guild_permission(ctx: &Context, guild_id: GuildId, perm: Permissions) -> Result<bool> {
+    let bot_id = ctx.cache.current_user().id;
+    let bot_member = guild_id.member(&ctx.http, bot_id).await?;
+    Ok(bot_member.permissions(&ctx.cache)?.contains(perm))
 }
 
 fn find_string<'a>(sub: &[ResolvedOption<'a>]) -> Option<&'a str> {
     sub.iter().find_map(|o| match o.value {
         ResolvedValue::String(s) => Some(s),
+        ResolvedValue::Autocomplete { value, .. } => Some(value),
         _ => None,
     })
 }
@@ -264,6 +412,13 @@ fn find_channel_action<'a>(group: &'a [ResolvedOption<'a>]) -> Option<(&'a str, 
     Some((chosen.name, channel_id))
 }
 
+fn find_channel(sub: &[ResolvedOption]) -> Option<u64> {
+    sub.iter().find_map(|o| match o.value {
+        ResolvedValue::Channel(c) => Some(c.id.get()),
+        _ => None,
+    })
+}
+
 fn find_role(sub: &[ResolvedOption]) -> Option<u64> {
     sub.iter().find_map(|o| match o.value {
         ResolvedValue::Role(r) => Some(r.id.get()),
@@ -287,7 +442,7 @@ fn channel_reply(channel_id: u64, changed: bool, did: &str, already: &str) -> St
     }
 }
 
-fn build_show_text(cfg: &crate::config::Config) -> String {
+fn build_show_text(cfg: &Config) -> String {
     let log_channel = if cfg.bot.log_channel_id == 0 {
         "disabled".to_string()
     } else {
@@ -322,7 +477,7 @@ fn build_show_text(cfg: &crate::config::Config) -> String {
 
 fn format_role_list(ids: &[u64]) -> String {
     if ids.is_empty() {
-        "none (falls back to the Manage Messages permission)".to_string()
+        "none (falls back to the Administrator permission)".to_string()
     } else {
         ids.iter().map(|id| format!("<@&{id}>")).collect::<Vec<_>>().join(", ")
     }
