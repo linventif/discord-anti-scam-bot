@@ -56,11 +56,21 @@ impl EventHandler for Handler {
         tracing::info!("{} reference image(s) in memory", self.store.len().await);
 
         tracing::info!("in {} guild(s)", ready.guilds.len());
+
+        // Global (not per-guild) so the command works in every server the bot is
+        // in without needing a fresh `ready` event — e.g. after being removed and
+        // re-added to a guild, which doesn't retrigger per-guild registration.
         let command = crate::slashconfig::build_config_command();
+        match serenity::model::application::Command::set_global_commands(&ctx.http, vec![command]).await {
+            Ok(_) => tracing::info!("/config command registered globally"),
+            Err(e) => tracing::warn!("could not register /config command globally: {e}"),
+        }
+
+        // Clean up the per-guild registrations from before this command became
+        // global, so it doesn't show up twice while global propagation catches up.
         for guild in &ready.guilds {
-            match guild.id.set_commands(&ctx.http, vec![command.clone()]).await {
-                Ok(_) => tracing::info!("/config command registered in guild {}", guild.id),
-                Err(e) => tracing::warn!("could not register /config command in guild {}: {e}", guild.id),
+            if let Err(e) = guild.id.set_commands(&ctx.http, Vec::new()).await {
+                tracing::debug!("could not clear guild commands in {}: {e}", guild.id);
             }
         }
     }

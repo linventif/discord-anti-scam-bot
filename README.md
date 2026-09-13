@@ -22,7 +22,7 @@ the offending messages, and sanctions the account according to config.
 
 ## Invite the bot
 
-[Add discord-anti-scam-bot to your server](https://discord.com/oauth2/authorize?client_id=1548610246358995014&permissions=1101659186182&integration_type=0&scope=bot)
+[Add discord-anti-scam-bot to your server](https://discord.com/oauth2/authorize?client_id=1548610246358995014&permissions=1101659235334&integration_type=0&scope=bot)
 
 ## Discord setup (Developer Portal)
 
@@ -89,6 +89,11 @@ anyone with the `Manage Messages` permission.
 - `!scam remove <file>` — removes a reference (filename as shown by `list`).
 
 ## `/config` slash command
+
+Registered as a **global** command (not per-guild), so it works in every server the bot is
+invited to without any extra step — including after being removed and re-added to a server.
+Global command registration/updates can take up to about an hour to fully propagate to every
+client, so don't be surprised if it's not instant right after a first deploy.
 
 Change settings live from Discord — no editing `config.toml` or restarting by hand. Requires
 being a server **Administrator** (or having a role listed in `mod_role_ids`); Discord's UI also
