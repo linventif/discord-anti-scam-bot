@@ -21,9 +21,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY --from=builder /app/target/release/discord_anti_scam_bot /usr/local/bin/discord-anti-scam-bot
 COPY config.example.toml ./config.example.toml
+# Baked in so a fresh deployment has the curated scam references from day one,
+# even before any volume is mounted over this path. A volume mounted at
+# /app/reference (see docker-compose.yml) still persists anything added
+# afterwards via `!scam add` — Docker populates a fresh named volume from the
+# image's existing content on first mount, though a bind-mount to an
+# already-existing empty host directory will still shadow these until you
+# copy them in once.
+COPY reference ./reference
 
-# reference/ (scam screenshots) and data/ (SQLite flood-detection db) are meant to
-# be mounted as volumes so they persist across container recreations.
-RUN mkdir -p reference data
+# data/ (SQLite: flood-detection state + per-server settings) is meant to be
+# mounted as a volume so it persists across container recreations.
+RUN mkdir -p data
 
 ENTRYPOINT ["/usr/local/bin/discord-anti-scam-bot"]

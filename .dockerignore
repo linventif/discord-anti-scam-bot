@@ -5,4 +5,3 @@ bot.log
 *.log
 config.toml
 data/
-reference/

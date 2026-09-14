@@ -73,15 +73,22 @@ cargo run --release
 cp .env.example .env        # set your DISCORD_TOKEN
 cp config.example.toml config.toml   # edit as needed
 
-mkdir -p reference data     # persisted outside the container
-# put your reference screenshots in ./reference/
-
 docker compose up -d --build
 ```
 
 `config.toml`, `reference/`, and `data/` (the SQLite database) are bind-mounted so they persist
 across image rebuilds and container recreations — see [docker-compose.yml](docker-compose.yml).
 To update after pulling new code: `docker compose up -d --build`.
+
+The image ships with the reference screenshots already committed to this repo baked in (see
+[Dockerfile](Dockerfile)), so a fresh deploy has them from the start — `!scam add` (or dropping
+files into `./reference/` and restarting) still adds more on top, persisted via the bind mount.
+
+If deploying via a PaaS (Dokploy, Coolify, etc.) that pulls a pre-built image (e.g. from
+`ghcr.io/linventif/discord-anti-scam-bot`) rather than building from this repo, remember the
+container's working directory is `/app` (see the Dockerfile's `WORKDIR`) — mount `config.toml`,
+`reference/`, and `data/` at `/app/config.toml`, `/app/reference`, and `/app/data` respectively,
+not at `/`.
 
 ## Releases
 
