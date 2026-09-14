@@ -115,13 +115,21 @@ impl ReferenceStore {
     }
 
     fn hash_file(&self, path: &Path) -> Result<ImageVariants> {
-        let img = image::open(path)
+        let mut reader = image::ImageReader::open(path)
+            .with_context(|| format!("could not open {}", path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("could not guess format of {}", path.display()))?;
+        reader.limits(decode_limits());
+        let img = reader
+            .decode()
             .with_context(|| format!("could not decode {}", path.display()))?;
         Ok(self.hash_image(&img))
     }
 
     pub fn hash_bytes(&self, bytes: &[u8]) -> Result<ImageVariants> {
-        let img = image::load_from_memory(bytes)?;
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+        reader.limits(decode_limits());
+        let img = reader.decode()?;
         Ok(self.hash_image(&img))
     }
 
@@ -168,6 +176,9 @@ impl ReferenceStore {
 
     /// Adds a new reference image (persisted to disk + hashed in memory).
     pub async fn add_from_bytes(&self, filename: &str, bytes: &[u8]) -> Result<()> {
+        if !is_safe_filename(filename) {
+            anyhow::bail!("invalid reference filename: {filename:?}");
+        }
         let path = self.dir.join(filename);
         std::fs::write(&path, bytes)
             .with_context(|| format!("could not write {}", path.display()))?;
@@ -183,6 +194,9 @@ impl ReferenceStore {
     }
 
     pub async fn remove(&self, filename: &str) -> Result<bool> {
+        if !is_safe_filename(filename) {
+            return Ok(false);
+        }
         let existed = self.entries.write().await.remove(filename).is_some();
         let path = self.dir.join(filename);
         if path.exists() {
@@ -200,6 +214,34 @@ impl ReferenceStore {
         v.sort();
         v
     }
+}
+
+/// Caps how much memory a single image decode may use. `image`'s own default
+/// (512 MiB, no dimension limit) is a safety net against decompression bombs
+/// but still generous enough that a handful of concurrent malicious decodes
+/// could exhaust memory on a small host. Every image we hash gets downsampled
+/// to a 16x16 grid anyway, so there's no legitimate need for headroom anywhere
+/// near the default — 128 MiB comfortably covers even a large real screenshot
+/// (a 4K RGBA frame is ~32 MiB decoded) with plenty of margin.
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits
+}
+
+/// A reference filename must be a single plain path component — no directory
+/// separators, no `..`. `add_from_bytes` and `remove` both take a filename that
+/// (transitively) comes from user input (a Discord attachment name, or a
+/// `!scam remove <name>` argument), and both do `self.dir.join(filename)` —
+/// without this check, `!scam remove ../../.env` would happily delete a file
+/// outside `reference/` entirely. This is a hard boundary, not just cleanliness.
+fn is_safe_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 #[cfg(test)]
@@ -265,5 +307,49 @@ mod tests {
             "middle-third-only repost should still match closely, got distance {}",
             m.distance
         );
+    }
+
+    /// Security regression: `!scam remove`/`!scam add` filenames come from user
+    /// input (Discord attachment names / command arguments). Neither must be able
+    /// to escape the reference directory.
+    #[tokio::test]
+    async fn rejects_path_traversal_in_filenames() {
+        let dir = std::env::temp_dir().join(format!(
+            "discord_anti_scam_bot_traversal_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let outside_target = std::env::temp_dir().join(format!(
+            "discord_anti_scam_bot_traversal_victim_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&outside_target, b"do not delete me").expect("create victim file");
+
+        let store = ReferenceStore::new(&dir);
+        store.load_dir().await.expect("create reference dir");
+
+        for evil in [
+            "../victim.txt",
+            "../../etc/passwd",
+            "a/b.jpg",
+            "..",
+            "",
+            "/etc/passwd",
+        ] {
+            let added = store.add_from_bytes(evil, b"fake image").await;
+            assert!(added.is_err(), "add_from_bytes should reject {evil:?}");
+
+            let removed = store.remove(evil).await.expect("remove should not error");
+            assert!(!removed, "remove should reject {evil:?} rather than touch it");
+        }
+
+        assert!(outside_target.exists(), "file outside reference/ must survive");
+        assert_eq!(
+            std::fs::read_to_string(&outside_target).unwrap(),
+            "do not delete me"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside_target);
     }
 }

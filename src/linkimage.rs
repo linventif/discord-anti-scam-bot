@@ -29,17 +29,29 @@ pub struct LinkImageFetcher {
 
 impl LinkImageFetcher {
     pub fn new(allowed_hosts: &[String]) -> Self {
+        let allowed_hosts: Vec<String> = allowed_hosts.iter().map(|h| h.to_lowercase()).collect();
+
+        // The initial URL's host is checked in `extract_urls`, but an allow-listed
+        // host issuing a redirect isn't itself vetted by that — without this, a
+        // compromised/malicious allow-listed host (or an open redirect on one)
+        // could steer the fetch at an internal address. Re-check every hop.
+        let redirect_hosts = allowed_hosts.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if host_is_allowed(attempt.url(), &redirect_hosts) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
+
         let client = reqwest::Client::builder()
             .user_agent("discord-anti-scam-bot/1.0")
             .timeout(Duration::from_secs(8))
-            .redirect(reqwest::redirect::Policy::limited(3))
+            .redirect(redirect_policy)
             .build()
             .expect("failed to build the link-fetching HTTP client");
 
-        Self {
-            client,
-            allowed_hosts: allowed_hosts.iter().map(|h| h.to_lowercase()).collect(),
-        }
+        Self { client, allowed_hosts }
     }
 
     /// Extracts candidate image URLs from message text whose host is allow-listed.
@@ -62,13 +74,7 @@ impl LinkImageFetcher {
         let Ok(parsed) = reqwest::Url::parse(url) else {
             return false;
         };
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        let host = host.to_lowercase();
-        self.allowed_hosts
-            .iter()
-            .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+        host_is_allowed(&parsed, &self.allowed_hosts)
     }
 
     /// Downloads the bytes of an image URL. If the URL points at an HTML page
@@ -98,7 +104,7 @@ impl LinkImageFetcher {
     }
 
     async fn get_with_content_type(&self, url: &str) -> Result<Option<(Vec<u8>, String)>> {
-        let resp = self
+        let mut resp = self
             .client
             .get(url)
             .send()
@@ -109,6 +115,14 @@ impl LinkImageFetcher {
             return Ok(None);
         }
 
+        // Bail before downloading anything if the server is upfront about a
+        // too-large body, and enforce the same cap while streaming in case it
+        // isn't (or lies) — an allow-listed host is still not a host we trust
+        // to hand us an unbounded response and have us buffer all of it.
+        if resp.content_length().is_some_and(|len| len > MAX_BYTES as u64) {
+            return Ok(None);
+        }
+
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -116,17 +130,30 @@ impl LinkImageFetcher {
             .unwrap_or("")
             .to_string();
 
-        let bytes = resp
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .with_context(|| format!("reading response body from {url}"))?;
-
-        if bytes.len() > MAX_BYTES {
-            return Ok(None);
+            .with_context(|| format!("reading response body from {url}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_BYTES {
+                return Ok(None);
+            }
         }
 
-        Ok(Some((bytes.to_vec(), content_type)))
+        Ok(Some((bytes, content_type)))
     }
+}
+
+fn host_is_allowed(url: &reqwest::Url, allowed_hosts: &[String]) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_lowercase();
+    allowed_hosts
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
 }
 
 fn find_og_image(html: &str) -> Option<String> {
@@ -150,6 +177,22 @@ mod tests {
             "imgur.com".to_string(),
             "i.imgur.com".to_string(),
         ])
+    }
+
+    /// The same check gates both the initial URL and every redirect hop
+    /// (`Policy::custom` in `new`) — this locks in the logic a compromised or
+    /// open-redirecting allow-listed host would need to bypass to steer a fetch
+    /// at an internal address.
+    #[test]
+    fn host_is_allowed_rejects_redirect_targets_outside_the_allow_list() {
+        let allowed = vec!["imgur.com".to_string()];
+        let allowed_url = reqwest::Url::parse("https://imgur.com/x.png").unwrap();
+        let internal_url = reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        let lookalike_url = reqwest::Url::parse("https://imgur.com.evil.tld/x.png").unwrap();
+
+        assert!(host_is_allowed(&allowed_url, &allowed));
+        assert!(!host_is_allowed(&internal_url, &allowed));
+        assert!(!host_is_allowed(&lookalike_url, &allowed));
     }
 
     #[test]

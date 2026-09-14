@@ -7,6 +7,15 @@ use serenity::prelude::*;
 use crate::config::GuildConfig;
 use crate::handler::Handler;
 
+/// Reference images are shared across every guild the bot is in (by design —
+/// see docs/ARCHITECTURE.md), which means a mod-role holder in *any one* of
+/// them can add to a data set every other guild pays the storage and
+/// per-message hashing cost of. Discord's own attachment size limit already
+/// bounds this loosely (and inconsistently, since it scales with a server's
+/// boost level), so enforce a tighter, consistent cap here too rather than
+/// relying on that alone.
+const MAX_REFERENCE_BYTES: u32 = 15 * 1024 * 1024;
+
 pub async fn handle_command(
     handler: &Handler,
     guild: &GuildConfig,
@@ -66,7 +75,13 @@ async fn cmd_add(handler: &Handler, ctx: &Context, msg: &Message) -> Result<()> 
     }
 
     let mut added = 0usize;
+    let mut too_large = 0usize;
     for att in &msg.attachments {
+        if att.size > MAX_REFERENCE_BYTES {
+            too_large += 1;
+            continue;
+        }
+
         let bytes = match att.download().await {
             Ok(b) => b,
             Err(e) => {
@@ -86,15 +101,17 @@ async fn cmd_add(handler: &Handler, ctx: &Context, msg: &Message) -> Result<()> 
         added += 1;
     }
 
-    msg.channel_id
-        .say(
-            &ctx.http,
-            format!(
-                "{added} reference image(s) added. Total: {}",
-                handler.store.len().await
-            ),
-        )
-        .await?;
+    let mut reply = format!(
+        "{added} reference image(s) added. Total: {}",
+        handler.store.len().await
+    );
+    if too_large > 0 {
+        let max_mb = MAX_REFERENCE_BYTES / (1024 * 1024);
+        reply.push_str(&format!(
+            "\n{too_large} image(s) skipped: over the {max_mb} MiB reference size limit."
+        ));
+    }
+    msg.channel_id.say(&ctx.http, reply).await?;
     Ok(())
 }
 
