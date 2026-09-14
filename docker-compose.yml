@@ -8,3 +8,12 @@ services:
       - ./config.toml:/app/config.toml:ro
       - ./reference:/app/reference
       - ./data:/app/data
+    # The bot logs to stdout (tracing_subscriber), which `docker logs` captures —
+    # no log file inside the container to worry about. Docker's default json-file
+    # driver doesn't rotate on its own though, so bound it here: at most 5 files
+    # of 10 MiB each per container (~50 MiB), oldest dropped first.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

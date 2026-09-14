@@ -90,6 +90,19 @@ container's working directory is `/app` (see the Dockerfile's `WORKDIR`) — mou
 `reference/`, and `data/` at `/app/config.toml`, `/app/reference`, and `/app/data` respectively,
 not at `/`.
 
+### Logs
+
+The bot logs to **stdout** (`tracing_subscriber`), not to a file — there's nothing inside the
+container to rotate or clean up. `docker compose logs -f bot` (or your platform's log viewer)
+shows it live. [docker-compose.yml](docker-compose.yml) caps Docker's own log storage (`json-file`
+driver, 10 MiB × 5 files) so it can't grow unbounded on the host; if you deploy via a PaaS that
+doesn't go through this compose file (e.g. Dokploy's image-based "Application" mode rather than
+its "Compose" mode), it manages log capture and retention itself instead.
+
+Verbosity is controlled by the standard `RUST_LOG` env var (e.g. `RUST_LOG=debug`, or
+`RUST_LOG=discord_anti_scam_bot=debug,warn` to go verbose for just this crate) — unset, it
+defaults to `info`.
+
 ## Releases
 
 Pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) triggers
