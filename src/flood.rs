@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use image_hasher::ImageHash;
 use rusqlite::Connection;
-use serenity::model::id::{ChannelId, GuildId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use tokio::sync::Mutex;
 
 /// Detects a strong sign of a compromised account: the same user posting the
@@ -25,6 +25,17 @@ pub struct FloodDetector {
     window_seconds: i64,
     same_image_threshold: u32,
     min_channels: usize,
+}
+
+/// A flood that just crossed the threshold.
+#[derive(Debug, PartialEq)]
+pub struct FloodHit {
+    /// Distinct channels hit by (a variant of) the same image.
+    pub channels: usize,
+    /// The *earlier* posts of that same image (not the one that triggered the
+    /// detection), so the caller can clean them up too — otherwise only the
+    /// last post of the flood ever gets deleted.
+    pub earlier_messages: Vec<(ChannelId, MessageId)>,
 }
 
 impl FloodDetector {
@@ -63,6 +74,13 @@ impl FloodDetector {
             [],
         );
 
+        // Same migration pattern: older databases have no message_id column.
+        // '' means "unknown / already handed out for deletion".
+        let _ = conn.execute(
+            "ALTER TABLE flood_posts ADD COLUMN message_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_flood_posts_guild_user_ts
                 ON flood_posts(guild_id, user_id, ts);",
@@ -77,16 +95,21 @@ impl FloodDetector {
         })
     }
 
-    /// Records an image post and returns the number of distinct channels (within
-    /// the same guild) hit by (a variant of) this same image if the flood
-    /// threshold is exceeded.
+    /// Records an image post and, if the flood threshold is exceeded, returns the
+    /// number of distinct channels (within the same guild) hit by (a variant of)
+    /// this same image plus the earlier posts that are part of the flood.
+    ///
+    /// Earlier posts are only returned once: their stored message id is cleared
+    /// when handed out, so a 4th/5th post of the same flood doesn't re-return
+    /// (and re-try deleting) messages that are already gone.
     pub async fn record_and_check(
         &self,
         guild: GuildId,
         user: UserId,
         channel: ChannelId,
+        message: MessageId,
         hash: ImageHash,
-    ) -> Option<usize> {
+    ) -> Option<FloodHit> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -95,6 +118,7 @@ impl FloodDetector {
         let guild_id = guild.get().to_string();
         let user_id = user.get().to_string();
         let channel_id = channel.get().to_string();
+        let message_id = message.get().to_string();
         let hash_b64 = hash.to_base64();
 
         let conn = self.conn.lock().await;
@@ -104,15 +128,17 @@ impl FloodDetector {
         }
 
         if let Err(e) = conn.execute(
-            "INSERT INTO flood_posts (guild_id, user_id, channel_id, hash, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![guild_id, user_id, channel_id, hash_b64, now],
+            "INSERT INTO flood_posts (guild_id, user_id, channel_id, message_id, hash, ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![guild_id, user_id, channel_id, message_id, hash_b64, now],
         ) {
             tracing::warn!("flood db insert failed: {e}");
             return None;
         }
 
         let mut stmt = match conn.prepare(
-            "SELECT channel_id, hash FROM flood_posts WHERE guild_id = ?1 AND user_id = ?2 AND ts >= ?3",
+            "SELECT id, channel_id, message_id, hash FROM flood_posts \
+             WHERE guild_id = ?1 AND user_id = ?2 AND ts >= ?3",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -122,9 +148,11 @@ impl FloodDetector {
         };
 
         let rows = match stmt.query_map(rusqlite::params![guild_id, user_id, cutoff], |row| {
-            let channel_id: String = row.get(0)?;
-            let hash: String = row.get(1)?;
-            Ok((channel_id, hash))
+            let id: i64 = row.get(0)?;
+            let channel_id: String = row.get(1)?;
+            let message_id: String = row.get(2)?;
+            let hash: String = row.get(3)?;
+            Ok((id, channel_id, message_id, hash))
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -134,19 +162,39 @@ impl FloodDetector {
         };
 
         let mut channels = HashSet::new();
-        for (channel_id, hash_str) in rows.flatten() {
+        let mut matched_rows = Vec::new();
+        let mut earlier_messages = Vec::new();
+        for (id, row_channel, row_message, hash_str) in rows.flatten() {
             if let Ok(other) = ImageHash::from_base64(&hash_str) {
                 if hash.dist(&other) <= self.same_image_threshold {
-                    channels.insert(channel_id);
+                    matched_rows.push(id);
+                    if row_message != message_id {
+                        if let (Ok(c), Ok(m)) = (row_channel.parse::<u64>(), row_message.parse::<u64>()) {
+                            if c != 0 && m != 0 {
+                                earlier_messages.push((ChannelId::new(c), MessageId::new(m)));
+                            }
+                        }
+                    }
+                    channels.insert(row_channel);
                 }
             }
         }
+        drop(stmt);
 
-        if channels.len() >= self.min_channels {
-            Some(channels.len())
-        } else {
-            None
+        if channels.len() < self.min_channels {
+            return None;
         }
+
+        for id in matched_rows {
+            if let Err(e) = conn.execute("UPDATE flood_posts SET message_id = '' WHERE id = ?1", [id]) {
+                tracing::warn!("flood db update failed: {e}");
+            }
+        }
+
+        Some(FloodHit {
+            channels: channels.len(),
+            earlier_messages,
+        })
     }
 
     /// Periodic cleanup of expired rows, for when the bot goes quiet for a while
@@ -207,15 +255,15 @@ mod tests {
         let hash = solid_color_hash(128);
 
         assert!(flood
-            .record_and_check(guild, user, ChannelId::new(1), hash.clone())
+            .record_and_check(guild, user, ChannelId::new(1), MessageId::new(100), hash.clone())
             .await
             .is_none());
         assert!(flood
-            .record_and_check(guild, user, ChannelId::new(2), hash.clone())
+            .record_and_check(guild, user, ChannelId::new(2), MessageId::new(200), hash.clone())
             .await
             .is_none());
-        let result = flood.record_and_check(guild, user, ChannelId::new(3), hash).await;
-        assert_eq!(result, Some(3));
+        let result = flood.record_and_check(guild, user, ChannelId::new(3), MessageId::new(300), hash).await;
+        assert_eq!(result.map(|h| h.channels), Some(3));
     }
 
     #[tokio::test]
@@ -225,17 +273,54 @@ mod tests {
         let user = UserId::new(1);
 
         assert!(flood
-            .record_and_check(guild, user, ChannelId::new(1), noise_hash(1))
+            .record_and_check(guild, user, ChannelId::new(1), MessageId::new(100), noise_hash(1))
             .await
             .is_none());
         assert!(flood
-            .record_and_check(guild, user, ChannelId::new(2), noise_hash(2))
+            .record_and_check(guild, user, ChannelId::new(2), MessageId::new(200), noise_hash(2))
             .await
             .is_none());
         assert!(flood
-            .record_and_check(guild, user, ChannelId::new(3), noise_hash(3))
+            .record_and_check(guild, user, ChannelId::new(3), MessageId::new(300), noise_hash(3))
             .await
             .is_none());
+    }
+
+    /// Regression test: a detected flood must hand back the *earlier* posts too,
+    /// otherwise only the post that crossed the threshold gets deleted and the
+    /// rest of the spam stays up in the other channels. Each earlier post is only
+    /// handed out once.
+    #[tokio::test]
+    async fn returns_the_earlier_posts_of_a_flood_once() {
+        let flood = FloodDetector::open(":memory:", 60, 6, 3).expect("open in-memory db");
+        let guild = GuildId::new(1);
+        let user = UserId::new(1);
+        let hash = solid_color_hash(128);
+
+        flood.record_and_check(guild, user, ChannelId::new(1), MessageId::new(100), hash.clone()).await;
+        flood.record_and_check(guild, user, ChannelId::new(2), MessageId::new(200), hash.clone()).await;
+        let hit = flood
+            .record_and_check(guild, user, ChannelId::new(3), MessageId::new(300), hash.clone())
+            .await
+            .expect("flood detected");
+        let mut earlier = hit.earlier_messages;
+        earlier.sort();
+        assert_eq!(
+            earlier,
+            vec![
+                (ChannelId::new(1), MessageId::new(100)),
+                (ChannelId::new(2), MessageId::new(200)),
+            ]
+        );
+
+        // A 4th post still counts as a flood, but must not re-return the posts
+        // already handed out for deletion (nor the 3rd, deleted by the caller).
+        let hit = flood
+            .record_and_check(guild, user, ChannelId::new(4), MessageId::new(400), hash)
+            .await
+            .expect("flood still detected");
+        assert_eq!(hit.channels, 4);
+        assert!(hit.earlier_messages.is_empty());
     }
 
     /// The same user posting in 3 channels that happen to be spread across two
@@ -248,16 +333,16 @@ mod tests {
         let hash = solid_color_hash(128);
 
         assert!(flood
-            .record_and_check(GuildId::new(1), user, ChannelId::new(1), hash.clone())
+            .record_and_check(GuildId::new(1), user, ChannelId::new(1), MessageId::new(100), hash.clone())
             .await
             .is_none());
         assert!(flood
-            .record_and_check(GuildId::new(1), user, ChannelId::new(2), hash.clone())
+            .record_and_check(GuildId::new(1), user, ChannelId::new(2), MessageId::new(200), hash.clone())
             .await
             .is_none());
         // Third post is in guild 2, not guild 1 — must not complete the guild-1 flood.
         assert!(flood
-            .record_and_check(GuildId::new(2), user, ChannelId::new(3), hash)
+            .record_and_check(GuildId::new(2), user, ChannelId::new(3), MessageId::new(300), hash)
             .await
             .is_none());
     }
@@ -276,13 +361,13 @@ mod tests {
 
         {
             let flood = FloodDetector::open(&db_path, 60, 6, 3).expect("open db");
-            flood.record_and_check(guild, user, ChannelId::new(1), hash.clone()).await;
-            flood.record_and_check(guild, user, ChannelId::new(2), hash.clone()).await;
+            flood.record_and_check(guild, user, ChannelId::new(1), MessageId::new(100), hash.clone()).await;
+            flood.record_and_check(guild, user, ChannelId::new(2), MessageId::new(200), hash.clone()).await;
         } // "restart": the FloodDetector (and its connection) is dropped here.
 
         let flood = FloodDetector::open(&db_path, 60, 6, 3).expect("reopen db");
-        let result = flood.record_and_check(guild, user, ChannelId::new(3), hash).await;
-        assert_eq!(result, Some(3), "flood history should persist across a restart");
+        let result = flood.record_and_check(guild, user, ChannelId::new(3), MessageId::new(300), hash).await;
+        assert_eq!(result.map(|h| h.channels), Some(3), "flood history should persist across a restart");
 
         let _ = std::fs::remove_file(&db_path);
     }
@@ -310,12 +395,17 @@ mod tests {
                 );",
             )
             .expect("create old flood_posts table");
+            conn.execute(
+                "INSERT INTO flood_posts (user_id, channel_id, hash, ts) VALUES ('1', '1', 'x', 0)",
+                [],
+            )
+            .expect("insert old-schema row");
         }
 
         // Must open (and add the missing column) without erroring.
         let flood = FloodDetector::open(&db_path, 60, 6, 3).expect("open pre-migration db");
         let result = flood
-            .record_and_check(GuildId::new(1), UserId::new(1), ChannelId::new(1), solid_color_hash(1))
+            .record_and_check(GuildId::new(1), UserId::new(1), ChannelId::new(1), MessageId::new(100), solid_color_hash(1))
             .await;
         assert_eq!(result, None);
 

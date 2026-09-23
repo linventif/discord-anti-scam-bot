@@ -12,7 +12,7 @@ use serenity::prelude::*;
 
 use crate::config::{Action, Config, GuildConfig};
 use crate::configstore::ConfigStore;
-use crate::flood::FloodDetector;
+use crate::flood::{FloodDetector, FloodHit};
 use crate::guildstore::GuildSettingsStore;
 use crate::hashstore::ReferenceStore;
 use crate::linkimage::LinkImageFetcher;
@@ -274,11 +274,23 @@ impl Handler {
         }
 
         if cfg.flood.enabled {
-            if let Some(channels) = self
+            if let Some(FloodHit { channels, earlier_messages }) = self
                 .flood
-                .record_and_check(guild_id, msg.author.id, msg.channel_id, hash.primary)
+                .record_and_check(guild_id, msg.author.id, msg.channel_id, msg.id, hash.primary)
                 .await
             {
+                // Only the post that crossed the threshold goes through
+                // on_detection — clean up the rest of the flood as well.
+                if guild.action != Action::LogOnly {
+                    for (channel_id, message_id) in earlier_messages {
+                        if let Err(e) = channel_id.delete_message(&ctx.http, message_id).await {
+                            tracing::warn!(
+                                "could not delete earlier flood message {message_id} in {channel_id}: {e}"
+                            );
+                        }
+                    }
+                }
+
                 self.on_detection(
                     guild,
                     ctx,

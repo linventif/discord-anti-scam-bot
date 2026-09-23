@@ -63,7 +63,7 @@ extra cost of comparing every variant isn't worth it here.
 It used to be a plain `HashMap<UserId, Vec<Post>>`. That's simpler, but it means a bot restart
 (redeploy, crash, `docker compose up -d --build`) forgets everything — a scammer mid-flood a
 moment before a restart gets a clean slate. SQLite fixes that at low cost: the table
-(`flood_posts`: `user_id`, `channel_id`, `hash` as base64, `ts`) is small, short-lived
+(`flood_posts`: `guild_id`, `user_id`, `channel_id`, `message_id`, `hash` as base64, `ts`) is small, short-lived
 (`DELETE ... WHERE ts < cutoff` runs on every insert, so it never grows past the window), and
 queries are a handful of rows per user — a plain `tokio::sync::Mutex<rusqlite::Connection>` is
 fine here; there was no need to reach for a connection pool or a `spawn_blocking` actor pattern
