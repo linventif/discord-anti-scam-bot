@@ -149,6 +149,10 @@ impl OcrScanner {
 
         let mut child = Command::new(&self.tesseract_path)
             .args(["stdin", "stdout", "-l", &self.languages])
+            // tesseract's OpenMP threads thrash badly when several runs (or other
+            // CPU-heavy work) share a few cores — a 1 s read blew past a 15 s
+            // timeout on a CI runner. Parallelism comes from `max_concurrent`.
+            .env("OMP_THREAD_LIMIT", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -345,7 +349,9 @@ mod tests {
     /// with a note otherwise, so a bare `cargo test` still passes.
     #[tokio::test]
     async fn reads_a_real_scam_screenshot() {
-        let Some(scanner) = OcrScanner::new(&OcrConfig::default()).await else {
+        // Generous timeout: other tests hash images in parallel on few CI cores.
+        let cfg = OcrConfig { timeout_seconds: 120, ..OcrConfig::default() };
+        let Some(scanner) = OcrScanner::new(&cfg).await else {
             eprintln!("skipping: tesseract not available");
             return;
         };
