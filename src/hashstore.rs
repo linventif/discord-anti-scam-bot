@@ -16,6 +16,7 @@ pub struct MatchResult {
 /// fragile to cropping — a screenshot with a sliver trimmed off an edge to dodge
 /// detection would otherwise hash very differently. Comparing every variant of an
 /// incoming image against every variant of a reference catches that case.
+#[derive(Clone)]
 pub struct ImageVariants {
     /// Hash of the untouched image — what flood-detection (same-post-many-channels)
     /// compares against, since that's about literal reposts, not evasion crops.
@@ -24,7 +25,7 @@ pub struct ImageVariants {
 }
 
 impl ImageVariants {
-    fn min_dist(&self, other: &ImageVariants) -> u32 {
+    pub(crate) fn min_dist(&self, other: &ImageVariants) -> u32 {
         self.all
             .iter()
             .flat_map(|a| other.all.iter().map(move |b| a.dist(b)))
@@ -223,7 +224,7 @@ impl ReferenceStore {
 /// to a 16x16 grid anyway, so there's no legitimate need for headroom anywhere
 /// near the default — 128 MiB comfortably covers even a large real screenshot
 /// (a 4K RGBA frame is ~32 MiB decoded) with plenty of margin.
-fn decode_limits() -> image::Limits {
+pub(crate) fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(128 * 1024 * 1024);
     limits

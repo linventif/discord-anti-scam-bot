@@ -27,3 +27,6 @@ dotenvy = "0.15"
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 regex = "1"
+
+[dev-dependencies]
+serde_json = "1"

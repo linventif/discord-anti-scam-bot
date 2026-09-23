@@ -14,7 +14,7 @@ use crate::handler::Handler;
 /// bounds this loosely (and inconsistently, since it scales with a server's
 /// boost level), so enforce a tighter, consistent cap here too rather than
 /// relying on that alone.
-const MAX_REFERENCE_BYTES: u32 = 15 * 1024 * 1024;
+pub const MAX_REFERENCE_BYTES: u32 = 15 * 1024 * 1024;
 
 pub async fn handle_command(
     handler: &Handler,
@@ -75,6 +75,7 @@ async fn cmd_add(handler: &Handler, ctx: &Context, msg: &Message) -> Result<()> 
     }
 
     let mut added = 0usize;
+    let mut retro = 0usize;
     let mut too_large = 0usize;
     for att in &msg.attachments {
         if att.size > MAX_REFERENCE_BYTES {
@@ -89,22 +90,22 @@ async fn cmd_add(handler: &Handler, ctx: &Context, msg: &Message) -> Result<()> 
                 continue;
             }
         };
-        let ext = std::path::Path::new(&att.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("png");
-        let filename = format!("ref_{}.{}", unique_suffix(), ext);
-        if let Err(e) = handler.store.add_from_bytes(&filename, &bytes).await {
-            tracing::warn!("could not add reference {filename}: {e:#}");
-            continue;
+        match handler.add_reference(ctx, &bytes, crate::review::extension_of(&att.filename)).await {
+            Ok(outcome) => {
+                added += 1;
+                retro += outcome.retro_matches;
+            }
+            Err(e) => tracing::warn!("could not add reference from {}: {e:#}", att.filename),
         }
-        added += 1;
     }
 
     let mut reply = format!(
         "{added} reference image(s) added. Total: {}",
         handler.store.len().await
     );
+    if retro > 0 {
+        reply.push_str(&format!("\nRetro-scan: {retro} recent post(s) matched and were handled."));
+    }
     if too_large > 0 {
         let max_mb = MAX_REFERENCE_BYTES / (1024 * 1024);
         reply.push_str(&format!(
@@ -143,7 +144,7 @@ async fn cmd_remove(handler: &Handler, ctx: &Context, msg: &Message, name: Optio
     Ok(())
 }
 
-fn unique_suffix() -> String {
+pub fn unique_suffix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

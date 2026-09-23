@@ -1,8 +1,8 @@
 # Detection
 
-How the bot decides an image is (probably) a known scam, without doing any OCR/ML classification
-— it's all perceptual-hash comparison against a curated reference set, plus one behavioral
-heuristic (flood detection).
+How the bot decides an image is (probably) a known scam: perceptual-hash comparison against a
+curated reference set, one behavioral heuristic (flood detection), and OCR of the image text
+scored against known scam phrasing. No ML classification.
 
 ## Perceptual hashing (`hashstore.rs`)
 
@@ -98,6 +98,62 @@ scanning and link scanning run once on the message itself and once per snapshot 
 `Handler::scan_attachments` / `scan_links` and their call sites in `handler.rs::message`), so a
 forwarded multi-image scam is checked exactly like a directly-posted one.
 
+## OCR text detection (`ocr.rs`)
+
+Hashing only recognizes an image it has (roughly) seen before. Scam waves reuse the same
+*template* with new pixels each time — the fake MrBeast "crypto casino" tweet came back with
+`sedowin.com` instead of `fayewin.com`, promo code `CASH` instead of `BET`, different amounts and
+crops, and none of the four screenshots came within the hash threshold of the references (best
+distances 20–45 for a threshold of 18). The wording, though, barely changes. So as a last check,
+the image is run through `tesseract` and its text is scored: each rule is a phrase + weight, every
+rule found adds its weight once, and a total ≥ `ocr.score_threshold` (6) is a detection.
+
+- **Weights are set so no generic word flags on its own** ("bonus" 1, "casino" 2, "withdraw" 1):
+  it takes one of the template's very specific phrases ("this post will be deleted", "was
+  successfully" — the scam's own broken English —, "activate code for bonus", "каждому новому
+  пользователю"...) or several weaker signals together. `ocr.rs::tests` has both the real OCR
+  output of the scam screenshots (must flag) and ordinary gaming/crypto screenshots text (must
+  not). Re-check both when touching the weights.
+- **Cyrillic look-alike folding.** With `eng+rus`, tesseract regularly reads Latin text with a few
+  Cyrillic homoglyphs mixed in ("Гат pleased", "ВАМК САВО"). `normalize()` folds those onto their
+  Latin twin — applied to both the text and the patterns, so Russian patterns still match.
+- **Color, not grayscale.** The image is decoded by us (same memory cap as hashing), downscaled
+  to `max_dimension`, and piped to tesseract as an RGB PNG — tesseract never parses the untrusted
+  original bytes. A naive grayscale conversion made tesseract miss the dark-theme popup text
+  entirely, so don't "optimize" that back in.
+- **Runs last and bounded**: only after the hash and flood checks, at most `max_concurrent`
+  tesseract processes at a time, each killed after `timeout_seconds`. Roughly 0.5–2 s per
+  screenshot.
+- **Shells out to the CLI** instead of linking libtesseract: no C/C++ build dependency, and a
+  missing binary just disables OCR at startup (warning logged, `/config show` says so).
+
+## Retro-scan and review (`recent.rs`, `review.rs`)
+
+A reference only helps from the moment it's added — but a scam wave is usually noticed a few
+minutes in, after some posts already got through. So every image that triggers nothing has its
+hash (not the image) kept in `RecentMedia` for `detection.retro_scan_minutes`, and
+`Handler::add_reference` — the single path behind `!scam add`, the "Add to scam references"
+context menu and the log's "➕" button — checks the new reference against that window with the
+normal `match_threshold`. Matches are grouped per (guild, author) and go through `on_detection`
+with *that* guild's settings: all their matching posts deleted, one sanction, one log.
+
+Entries leave the window once acted on (`take_matches` removes them), and `on_detection` also
+`forget`s every message it handles — without that, confirming a flood with "➕" would retro-match
+the flood's earlier posts (recorded as harmless before the flood was detected, then deleted) and
+sanction/log the author a second time.
+
+**Author sweep.** The same window serves the other direction: when `on_detection` fires for an
+author, `sweep_author` pulls that author's other entries in the same guild whose *message time*
+(snowflake) is within ±`retro_scan_minutes` of the flagged message, and checks each against the
+flagged image's hash, the references and — re-fetching the message, since only hashes are kept,
+capped at 10 per detection — OCR. Matches are deleted as part of the same detection (same
+sanction, same log). A compromised account that posted four different scam screenshots only
+needs one of them to be caught.
+
+Human review happens on the log messages: flood/OCR detections can be confirmed (→ reference) or
+dismissed, reference-based ones can remove the reference. Buttons are gated server-side like
+`!scam` (mod roles, else Manage Messages) — anyone who can see the log channel can *click* them.
+
 ## Tuning
 
 | Setting | Effect of raising it | Effect of lowering it |
@@ -106,3 +162,4 @@ forwarded multi-image scam is checked exactly like a directly-posted one.
 | `flood.min_channels` | Needs a wider spray before flagging (fewer false positives, slower to catch) | Flags narrower reposting patterns (faster to catch, more prone to flagging a legitimately-shared image) |
 | `flood.window_seconds` | Catches slower/more spread-out flooding | Only catches fast, bursty flooding |
 | `flood.same_image_threshold` | Groups more distinct images together as "the same" for flood purposes | Requires near-identical images to count as a repeat |
+| `ocr.score_threshold` | Needs more scam phrases in one image (fewer false positives, may miss a lone popup) | Flags on fewer phrases (catches more variants, more prone to flagging a legit screenshot) |

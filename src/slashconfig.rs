@@ -231,7 +231,7 @@ async fn run(
             _ => "Invalid duration.".to_string(),
         },
 
-        ("show", _) => build_show_text(cfg, guild),
+        ("show", _) => build_show_text(cfg, guild, handler.ocr.is_some()),
 
         ("mod-role", ResolvedValue::SubCommandGroup(group)) => match find_role_action(group) {
             Some(("add", role_id)) => {
@@ -459,7 +459,7 @@ fn channel_reply(channel_id: u64, changed: bool, did: &str, already: &str) -> St
     }
 }
 
-fn build_show_text(cfg: &Config, guild: &GuildConfig) -> String {
+fn build_show_text(cfg: &Config, guild: &GuildConfig, ocr_available: bool) -> String {
     let log_channel = if guild.log_channel_id == 0 {
         "disabled".to_string()
     } else {
@@ -482,7 +482,8 @@ fn build_show_text(cfg: &Config, guild: &GuildConfig) -> String {
          **Bot-wide settings** (same for every server the bot is in)\n\
          - Match threshold: {} (hash distance)\n\
          - Flood detection: {} (min {} channels within {}s)\n\
-         - Link images: {} ({} allow-listed host(s))",
+         - Link images: {} ({} allow-listed host(s))\n\
+         - OCR text detection: {} (score threshold {})",
         guild.action.as_toml_str(),
         guild.timeout_minutes,
         cfg.detection.match_threshold,
@@ -491,6 +492,12 @@ fn build_show_text(cfg: &Config, guild: &GuildConfig) -> String {
         cfg.flood.window_seconds,
         if cfg.links.enabled { "on" } else { "off" },
         cfg.links.allowed_hosts.len(),
+        match (cfg.ocr.enabled, ocr_available) {
+            (false, _) => "off",
+            (true, true) => "on",
+            (true, false) => "off (tesseract not available)",
+        },
+        cfg.ocr.score_threshold,
     )
 }
 

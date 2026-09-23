@@ -22,6 +22,13 @@ reference_dir = "reference"
 # Lower = stricter match (fewer false positives, but may miss slightly cropped/recompressed
 # scams). ~15-20 is a good starting point.
 match_threshold = 18
+# When a reference is added (!scam add, the "Add to scam references" context menu, or the
+# review button in the log channel), images posted in the last N minutes that didn't
+# trigger anything are re-checked against it and handled like a normal detection
+# (retro-scan). Also used when someone gets flagged: their other image posts within
+# ±N minutes of the flagged message are checked (same image, references, OCR) and
+# handled with it. Only image hashes are kept in memory for this, never the images. 0 = off.
+retro_scan_minutes = 30
 
 # Flood detection: the same account posting the same image across several different
 # channels of the same server in a short time is a strong sign of a compromised
@@ -47,6 +54,37 @@ allowed_hosts = [
     "cdn.discordapp.com",
     "media.discordapp.net",
 ]
+
+# OCR text detection: reads the text in each image (with the `tesseract` CLI) and
+# flags it if it contains enough known scam phrasing — catches NEW screenshots of a
+# known scam template (different domain, promo code, amounts, crop) that the
+# reference hashes don't match yet. Runs last, only on images that passed the
+# reference and flood checks. The whole [ocr] section is optional (these are the
+# defaults); if tesseract isn't installed, OCR is just disabled with a warning.
+[ocr]
+enabled = true
+# tesseract binary (installed in the Docker image; `apt install tesseract-ocr
+# tesseract-ocr-eng tesseract-ocr-rus` otherwise).
+tesseract_path = "tesseract"
+# tesseract language packs to read with, `+`-separated.
+languages = "eng+rus"
+# Sum of the matched rules' weights needed to flag an image.
+score_threshold = 6
+# Kill a tesseract run that takes longer than this.
+timeout_seconds = 15
+# Max tesseract processes at once (each uses ~1 CPU core while it runs).
+max_concurrent = 2
+# Larger images are downscaled to fit this size before OCR.
+max_dimension = 2000
+# Phrases to look for, each with a weight. Matching ignores case, punctuation and
+# Cyrillic/Latin look-alike letters. Leave unset to use the built-in list (see
+# `default_rules` in src/ocr.rs) — setting any rule here REPLACES that list.
+# [[ocr.rules]]
+# pattern = "was successfully"
+# weight = 4
+# [[ocr.rules]]
+# pattern = "promo code"
+# weight = 3
 
 [storage]
 # SQLite database used to persist flood-detection state and per-server settings

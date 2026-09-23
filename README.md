@@ -18,7 +18,11 @@ settings](#per-server-settings-config-above) below.
    short time (typical of a compromised account spamming everywhere it has access to), it's
    flagged even if the image isn't in the reference set yet. This activity is persisted to
    SQLite, so it survives a bot restart.
-4. Based on that server's `/config` settings, the bot deletes the message and applies (or not) a
+4. Last, the text in the image is read with OCR (tesseract) and scored against known scam
+   phrasing ("this post will be deleted", "activate code for bonus", "Withdrawal ... Was
+   Successfully"...) — this catches *new* screenshots of a known scam template that no reference
+   matches yet.
+5. Based on that server's `/config` settings, the bot deletes the message and applies (or not) a
    sanction: timeout, kick, or ban. Every detection is logged to that server's own dedicated
    channel with evidence (image, matched
    reference, score, action taken).
@@ -129,6 +133,33 @@ below), or by default to anyone with the `Manage Messages` permission.
   (useful whenever a moderator spots a new screenshot that isn't known yet).
 - `!scam list` — lists the reference files currently in memory.
 - `!scam remove <file>` — removes a reference (filename as shown by `list`).
+- **Right click a message → Apps → "Add to scam references"** — adds every image in that
+  message (attachments, forwarded images, allow-listed image links) as references, without
+  having to re-upload them. The addition is posted to the log channel with the image(s) and a
+  "✖ False positive: remove" button, so another moderator can review it.
+
+### Reviewing detections
+
+Every detection posted in the log channel comes with buttons (same permission check as above):
+
+- Flood / OCR detection (image not a reference yet): **➕ Scam: add to references** turns the
+  evidence image into a reference; **✖ False positive** dismisses it and lifts the author's
+  timeout (if the server's action is `delete_timeout` — a kick/ban can't be undone this way).
+- Known-reference detection: **✖ False positive: remove `<reference>`** deletes that reference and
+  lifts the timeout.
+
+The log message then records who decided what, and its buttons are removed.
+
+### Retro-scan
+
+Whenever a reference is added (by any of the ways above), the bot also checks it against the
+images posted in the last `detection.retro_scan_minutes` (30 by default) that hadn't triggered
+anything, and handles every match like a normal detection — so posts that got through before the
+reference existed get cleaned up too, one sanction and one log per author.
+
+Likewise, when an author gets flagged (by any detection), their other image posts in that server
+within ±`retro_scan_minutes` of the flagged message are checked too — against the flagged image,
+the references, and OCR — and the matching ones are deleted along with it.
 
 The reference set itself is shared across every server the bot is in (a scam flagged on one
 server is recognized on all of them) — only who's *allowed to manage it* is checked per-server.

@@ -6,6 +6,9 @@ mod guildstore;
 mod handler;
 mod hashstore;
 mod linkimage;
+mod ocr;
+mod recent;
+mod review;
 mod slashconfig;
 
 use std::sync::Arc;
@@ -21,6 +24,7 @@ use guildstore::GuildSettingsStore;
 use handler::Handler;
 use hashstore::ReferenceStore;
 use linkimage::LinkImageFetcher;
+use ocr::OcrScanner;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,6 +71,7 @@ async fn main() -> Result<()> {
     }
 
     let links = LinkImageFetcher::new(&config.links.allowed_hosts);
+    let ocr = OcrScanner::new(&config.ocr).await.map(Arc::new);
 
     let token = std::env::var("DISCORD_TOKEN")
         .context("missing DISCORD_TOKEN environment variable (see .env.example)")?;
@@ -79,6 +84,9 @@ async fn main() -> Result<()> {
         store,
         flood,
         links,
+        ocr,
+        // Hashes only (~1 KB each), so even a busy multi-server hour fits easily.
+        recent: recent::RecentMedia::new(Duration::from_secs(config.detection.retro_scan_minutes * 60), 5000),
     };
 
     let mut client = Client::builder(&token, intents)

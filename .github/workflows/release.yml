@@ -81,3 +81,21 @@ jobs:
         with:
           files: dist/*.tar.gz
           generate_release_notes: true
+
+  # Redeploy once the new :latest image is pushed. Set the DEPLOY_WEBHOOK_URL repo
+  # secret to your PaaS's redeploy webhook (Dokploy/Coolify: the service's
+  # "Deploy webhook" URL); without it this job is a no-op.
+  redeploy:
+    needs: [docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger redeploy webhook
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_WEBHOOK_URL" ]; then
+            echo "DEPLOY_WEBHOOK_URL secret not set, skipping redeploy"
+            exit 0
+          fi
+          curl -fsS -X POST "$DEPLOY_WEBHOOK_URL"
+

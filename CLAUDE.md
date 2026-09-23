@@ -16,7 +16,7 @@ non-trivial changes instead of re-deriving the design from the source.
 ```bash
 cargo build              # dev build
 cargo build --release    # what actually gets deployed
-cargo test                # 14 tests as of writing; keep them passing
+cargo test                # 27 tests as of writing; keep them passing
 cargo check               # fast type-check while iterating
 ```
 
@@ -25,6 +25,10 @@ No `rustfmt`/`clippy` gate in CI yet — match the existing style in whatever fi
 Building needs a C compiler (`cc`/`gcc`) on PATH — `rusqlite`'s `bundled` feature compiles SQLite
 from source. If a fresh environment fails with `linker 'cc' not found`, that's the fix (e.g.
 `apt install build-essential`), not a code problem.
+
+OCR (`ocr.rs`) shells out to the `tesseract` CLI at runtime (installed in the Docker image and in
+CI). Without it locally, OCR is simply disabled and `ocr::tests::reads_a_real_scam_screenshot`
+skips itself — install `tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus` to run it for real.
 
 ## Config: bot-wide (TOML) vs. per-guild (SQLite) — don't mix these up
 

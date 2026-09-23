@@ -13,6 +13,10 @@ pub struct Config {
     pub detection: DetectionConfig,
     pub flood: FloodConfig,
     pub links: LinksConfig,
+    /// Optional in config.toml (defaults apply), so an existing deployment's
+    /// config keeps loading after an upgrade.
+    #[serde(default)]
+    pub ocr: OcrConfig,
     pub storage: StorageConfig,
 }
 
@@ -60,6 +64,14 @@ impl Action {
 pub struct DetectionConfig {
     pub reference_dir: String,
     pub match_threshold: u32,
+    /// How far back a newly added reference is checked against recent posts
+    /// (retro-scan). Optional in config.toml. 0 disables it.
+    #[serde(default = "default_retro_scan_minutes")]
+    pub retro_scan_minutes: u64,
+}
+
+fn default_retro_scan_minutes() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -75,6 +87,41 @@ pub struct LinksConfig {
     pub enabled: bool,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct OcrConfig {
+    pub enabled: bool,
+    pub tesseract_path: String,
+    pub languages: String,
+    pub score_threshold: u32,
+    pub timeout_seconds: u64,
+    pub max_concurrent: usize,
+    pub max_dimension: u32,
+    /// Empty = use the built-in phrase list (`ocr::default_rules`).
+    pub rules: Vec<OcrRule>,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tesseract_path: "tesseract".to_string(),
+            languages: "eng+rus".to_string(),
+            score_threshold: 6,
+            timeout_seconds: 15,
+            max_concurrent: 2,
+            max_dimension: 2000,
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OcrRule {
+    pub pattern: String,
+    pub weight: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]

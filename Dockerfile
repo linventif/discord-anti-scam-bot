@@ -15,7 +15,10 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
+# tesseract (+ English/Russian language data) powers OCR text detection (see
+# [ocr] in config.example.toml); without it the bot still runs, OCR just stays off.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+        tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

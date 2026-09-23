@@ -15,8 +15,11 @@ pieces fit together, not the algorithms inside them.
 | `handler.rs` | The `serenity::EventHandler` impl: `message` (the detection pipeline), `interaction_create` (dispatches to slash commands), `ready` (registers the global `/config` command). |
 | `hashstore.rs` | `ReferenceStore`: loads reference images, computes perceptual hashes (including crop-resistant variants), compares an incoming image against the set. |
 | `flood.rs` | `FloodDetector`: tracks recent image posts per user across channels (scoped to one guild) in SQLite, to catch a compromised account cross-posting the same image everywhere. |
+| `ocr.rs` | `OcrScanner`: runs the `tesseract` CLI on an image and scores its text against weighted scam phrases, to catch new screenshots of a known scam template. Disabled (`None` in `Handler`) if tesseract is missing. |
 | `linkimage.rs` | `LinkImageFetcher`: extracts allow-listed image URLs from message text and downloads them (following one `og:image` hop for HTML pages like imgur galleries). |
 | `slashconfig.rs` | Builds the `/config` command tree and handles both its execution and its autocomplete (the log-channel picker). Every setting it touches is per-guild. |
+| `review.rs` | The "Add to scam references" message context-menu command, and the review buttons on log messages (confirm scam / false positive / remove reference). Stateless: each button's `custom_id` carries what it needs. |
+| `recent.rs` | `RecentMedia`: in-memory look-back window of recent image hashes (no bytes) that didn't trigger anything, for the retro-scan run by `Handler::add_reference` whenever a reference is added. |
 | `commands.rs` | The legacy `!scam add/list/remove` prefix commands for managing reference images (shared across guilds, see "Multi-guild" below). |
 
 ## Data flow: a message arrives
@@ -44,7 +47,16 @@ Handler::message(ctx, msg)
              │
              ├─ ReferenceStore::hash_bytes → best_match  ──► known reference? → on_detection
              │
-             └─ FloodDetector::record_and_check          ──► cross-channel repost? → on_detection
+             ├─ FloodDetector::record_and_check          ──► cross-channel repost? → on_detection
+             │                                                (+ delete the earlier posts)
+             │
+             ├─ OcrScanner::check (tesseract, slowest)   ──► scam phrasing? → on_detection
+             │
+             └─ nothing matched → RecentMedia::record (for a later retro-scan)
+
+Handler::add_reference (!scam add, context menu, "➕" review button)
+      ├─ ReferenceStore::add_from_bytes
+      └─ RecentMedia::take_matches → on_detection per (guild, author), with that guild's settings
                                                                         │
                                                                         ▼
                                                               delete message / timeout /
